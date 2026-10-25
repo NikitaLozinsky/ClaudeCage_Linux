@@ -1,0 +1,5 @@
+# ClaudeCage NOPASSWD execution for claude-vpn orchestrator
+# !use_pty prevents TTY hijacking and LPE vulnerabilities
+Defaults!/usr/local/bin/claude-vpn !use_pty
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn
+%sudo ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn

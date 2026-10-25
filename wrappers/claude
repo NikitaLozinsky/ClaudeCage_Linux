@@ -1,0 +1,15 @@
+#!/bin/bash
+# ============================================================
+# Claude Code (CLI) Transparent Wrapper
+# Runs Claude inside the hardened network namespace with Kill Switch
+# ============================================================
+if [ "${CLAUDE_VPN_INTERNAL:-0}" = "1" ]; then
+    if [ -x "$HOME/.local/bin/claude-raw" ]; then
+        exec "$HOME/.local/bin/claude-raw" "$@"
+    elif [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
+        exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
+    else
+        exec claude "$@"
+    fi
+fi
+exec sudo /usr/local/bin/claude-vpn claude "$@"

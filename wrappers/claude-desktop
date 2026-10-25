@@ -1,0 +1,15 @@
+#!/bin/sh
+# ============================================================
+# Claude Desktop (Electron) Transparent Wrapper
+# Runs Claude Desktop inside the hardened network namespace
+# ============================================================
+if [ "${CLAUDE_VPN_INTERNAL:-0}" = "1" ]; then
+    if [ -x "/usr/bin/claude-desktop" ]; then
+        exec /usr/bin/claude-desktop "$@"
+    elif [ -x "/usr/lib/claude-desktop/claude-desktop" ]; then
+        exec /usr/lib/claude-desktop/claude-desktop "$@"
+    else
+        exec claude-desktop "$@"
+    fi
+fi
+exec sudo /usr/local/bin/claude-vpn claude-desktop "$@"

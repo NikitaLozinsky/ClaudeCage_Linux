@@ -1,0 +1,13 @@
+[Unit]
+Description=ClaudeCage Network Jail and Hardened Kill Switch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/claude-vpn --up
+ExecStop=/usr/local/bin/claude-vpn --down
+
+[Install]
+WantedBy=multi-user.target

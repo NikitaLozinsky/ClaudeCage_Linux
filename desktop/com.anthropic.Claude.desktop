@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Claude
+Comment=Anthropic Claude Desktop (Jailed in ClaudeCage)
+Exec=/usr/local/bin/claude-vpn claude-desktop %u
+Icon=claude-desktop
+Type=Application
+StartupNotify=true
+Categories=Utility;Development;
+MimeType=x-scheme-handler/claude;

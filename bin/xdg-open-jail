@@ -1,0 +1,6 @@
+#!/bin/sh
+# Блокировка открытия ссылок в браузере хоста (вне VPN)
+printf '%s' "$1" | xclip -selection clipboard 2>/dev/null || true
+DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" notify-send -u critical "Claude VPN Jail" "Ссылка скопирована в буфер обмена (открытие в хост-браузере заблокировано): $1" 2>/dev/null || true
+echo "[claude-vpn] URL скопирован в буфер (не открывай без VPN!): $1" >&2
+exit 0

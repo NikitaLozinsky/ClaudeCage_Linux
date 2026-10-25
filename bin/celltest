@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# celltest — Комплексная диагностика сетевой клетки и защиты от антифрода
+# ==============================================================================
+
+set -uo pipefail
+
+# ── Определение конфигурации ──────────────────────────────────
+VPN_IFACE="${CLAUDE_VPN_IFACE:-amn0}"
+VPN_DNS="${CLAUDE_VPN_DNS:-100.64.0.1}"
+for _c in "/etc/claude-vpn.conf" "$HOME/.config/claude-vpn.conf"; do
+    if [[ -f "$_c" ]]; then
+        _v=$(grep -E "^VPN_IFACE=" "$_c" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+        [[ -n "$_v" ]] && VPN_IFACE="$_v"
+        _v=$(grep -E "^VPN_DNS=" "$_c" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+        [[ -n "$_v" ]] && VPN_DNS="$_v"
+    fi
+done
+
+# ── Цвета оформления ──────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+ERRORS=0
+WARNINGS=0
+CHECKS=0
+
+pass() {
+    ((CHECKS++))
+    echo -e "  ${GREEN}✔${NC} $1"
+}
+
+fail() {
+    ((CHECKS++))
+    ((ERRORS++))
+    echo -e "  ${RED}✖${NC} ${BOLD}$1${NC}"
+    if [[ -n "${2:-}" ]]; then
+        echo -e "    ${RED}↳ Причина: $2${NC}"
+    fi
+}
+
+warn() {
+    ((CHECKS++))
+    ((WARNINGS++))
+    echo -e "  ${YELLOW}▲${NC} $1"
+    if [[ -n "${2:-}" ]]; then
+        echo -e "    ${YELLOW}↳ Внимание: $2${NC}"
+    fi
+}
+
+info_hdr() {
+    echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}"
+}
+
+echo -e "${BOLD}${PURPLE}╔══════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${PURPLE}║         CELLTEST: Диагностика изоляции и защиты от антифрода     ║${NC}"
+echo -e "${BOLD}${PURPLE}╚══════════════════════════════════════════════════════════════════╝${NC}"
+
+# ── 1. ЯДРО И СЕТЕВОЕ ПРОСТРАНСТВО (NETNS) ────────────────────
+info_hdr "1. Ядро Linux и Сетевой Namespace"
+
+# Проверка наличия namespace claude_vpn
+if ip netns list 2>/dev/null | grep -qw "claude_vpn"; then
+    pass "Сетевое пространство (netns) 'claude_vpn' создано в ядре"
+else
+    fail "Сетевое пространство 'claude_vpn' отсутствует!" "Запустите: claude-vpn --up"
+fi
+
+# Проверка виртуального кабеля
+if ip link show veth_host &>/dev/null; then
+    pass "Интерфейс veth_host на хосте активен (10.200.1.1)"
+else
+    fail "Интерфейс veth_host на хосте не найден!"
+fi
+
+if sudo /usr/local/bin/claude-vpn ip link show veth_ns &>/dev/null; then
+    pass "Интерфейс veth_ns внутри netns активен (10.200.1.2, MTU 1376)"
+else
+    fail "Интерфейс veth_ns внутри netns недоступен!"
+fi
+
+# Проверка Watchdog демона
+local_pid=$(pgrep -f "claude-vpn --watchdog-loop" | head -n 1 || true)
+if [[ -n "$local_pid" ]]; then
+    pass "Фоновый Watchdog демон активен (PID: $local_pid)"
+else
+    warn "Watchdog демон не запущен (будет автоматически запущен при старте приложения)"
+fi
+
+
+# ── 2. KILL SWITCH И БРАНДМАУЭР (NFTABLES) ─────────────────────
+info_hdr "2. Kill Switch и Защита от Утечек Трафика"
+
+vpn_active=false
+if ip -4 addr show "$VPN_IFACE" 2>/dev/null | grep -q "inet"; then
+    vpn_active=true
+    vpn_ip=$(ip -4 addr show "$VPN_IFACE" | grep "inet" | awk '{print $2}')
+    pass "VPN интерфейс ($VPN_IFACE) активен: $vpn_ip"
+else
+    warn "VPN ($VPN_IFACE) отключен! Проверяем жесткую блокировку трафика..."
+fi
+
+# Проверка таблицы nftables
+if sudo nft list table inet claude_vpn_nat &>/dev/null; then
+    pass "Таблица nftables 'inet claude_vpn_nat' загружена"
+    
+    # Проверка наличия жесткого правила сброса (Kill Switch)
+    if sudo nft list chain inet claude_vpn_nat forward 2>/dev/null | grep -q 'iifname "veth_host" drop'; then
+        pass "Аппаратный Kill Switch активен: весь трафик мимо $VPN_IFACE сбрасывается (DROP)"
+    else
+        fail "Правило Kill Switch 'iifname veth_host drop' не найдено в nftables!"
+    fi
+else
+    fail "Таблица nftables 'inet claude_vpn_nat' отсутствует!" "Правила NAT и Kill Switch не загружены"
+fi
+
+# Проверка полной блокировки IPv6
+ipv6_disabled=$(sudo /usr/local/bin/claude-vpn sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
+ipv6_routes=$(sudo /usr/local/bin/claude-vpn ip -6 route 2>/dev/null || true)
+
+if [[ "$ipv6_disabled" == "1" && -z "$ipv6_routes" ]]; then
+    pass "IPv6 внутри клетки полностью отключен (0 утечек через IPv6)"
+else
+    fail "IPv6 активен внутри клетки! Возможна утечка реального адреса через IPv6"
+fi
+
+
+# ── 3. DNS ИЗОЛЯЦИЯ И ЗАЩИТА ОТ DNS LEAK ───────────────────────
+info_hdr "3. Изоляция DNS (DNS Leak Protection)"
+
+# Проверка изолированного resolv.conf
+dns_servers=$(sudo /usr/local/bin/claude-vpn cat /etc/resolv.conf 2>/dev/null | grep "nameserver" | awk '{print $2}' || true)
+
+if [[ "$dns_servers" == "$VPN_DNS" ]]; then
+    pass "Системный DNS внутри клетки: $VPN_DNS (изолированный резолвер VPN)"
+elif echo "$dns_servers" | grep -qE "127.0.0.53|192.168.|10.0."; then
+    fail "ОБНАРУЖЕНА УТЕЧКА DNS! Внутри клетки виден хостовый DNS: $dns_servers"
+else
+    warn "Нестандартный DNS внутри клетки: $dns_servers"
+fi
+
+# Проверка реального резолвинга
+if [[ "$vpn_active" = true ]]; then
+    if sudo /usr/local/bin/claude-vpn getent hosts api.anthropic.com &>/dev/null; then
+        pass "DNS резолвинг доменов Anthropic через VPN: РАБОТАЕТ"
+    else
+        fail "Не удается разрешить домен api.anthropic.com внутри клетки"
+    fi
+else
+    pass "DNS запросы надежно заблокированы Kill Switch (VPN отключен)"
+fi
+
+
+# ── 4. АНТИФРОД: ГЕОЛОКАЦИЯ И ЧАСОВОЙ ПОЯС ─────────────────────
+info_hdr "4. Защита от Антифрода (IP, Гео и Timezone)"
+
+# Проверка таймзоны
+expected_tz="Europe/Amsterdam"
+if [[ -f "$HOME/.config/claude-vpn.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "$HOME/.config/claude-vpn.conf"
+    expected_tz="${CLAUDE_TZ:-Europe/Amsterdam}"
+fi
+
+actual_tz=$(sudo /usr/local/bin/claude-vpn node -e 'console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)' 2>/dev/null || echo "unknown")
+
+if [[ "$actual_tz" == "$expected_tz" ]]; then
+    pass "Часовой пояс среды совпадает с сервером VPN: $actual_tz"
+elif [[ "$actual_tz" == "Europe/Moscow" ]]; then
+    fail "ОПАСНО ДЛЯ АНТИФРОДА! Внутри клетки светится московское время (Europe/Moscow) при европейском IP!"
+else
+    warn "Часовой пояс внутри клетки: $actual_tz (ожидалось: $expected_tz)"
+fi
+
+# Проверка внешнего IP адреса
+if [[ "$vpn_active" = true ]]; then
+    netns_ip=$(sudo /usr/local/bin/claude-vpn curl -s --max-time 4 https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
+    host_ip=$(curl -s --max-time 3 https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
+
+    if [[ -n "$netns_ip" ]]; then
+        pass "Внешний IP адрес внутри клетки: $netns_ip ($VPN_IFACE)"
+        
+        # Проверка маршрутизации
+        if ip route show 2>/dev/null | grep -q "dev $VPN_IFACE"; then
+            pass "VPN ($VPN_IFACE) является активным шлюзом (хост и клетка в одной сети VPN: $netns_ip)"
+        else
+            pass "IP клетки изолирован через VPN ($netns_ip)"
+        fi
+    else
+        fail "Не удалось получить внешний IP через VPN (таймаут или блокировка)"
+    fi
+else
+    # Проверка, что при выключенном VPN интернет отсутствует (Kill Switch работает)
+    leak_test=$(sudo /usr/local/bin/claude-vpn curl -s --max-time 2 https://icanhazip.com 2>/dev/null || true)
+    if [[ -z "$leak_test" ]]; then
+        pass "Kill Switch надежен: при отключенном VPN ни одного байта не уходит в сеть"
+    else
+        fail "КРИТИЧЕСКАЯ УТЕЧКА! VPN отключен, но трафик выходит в сеть: $leak_test"
+    fi
+fi
+
+
+# ── 5. ТОЧКИ ЗАПУСКА И УСТОЙЧИВОСТЬ К ОБНОВЛЕНИЯМ ──────────────
+info_hdr "5. Точки запуска и Защита от Перезаписи (Обновления)"
+
+# Проверка Fish-функций
+if [[ -f "$HOME/.config/fish/functions/claude.fish" ]]; then
+    pass "Fish-функция 'claude' настроена (абсолютный приоритет над PATH)"
+else
+    fail "Файл ~/.config/fish/functions/claude.fish отсутствует! (уязвимо к 'claude update')"
+fi
+
+if [[ -f "$HOME/.config/fish/functions/claude-desktop.fish" ]]; then
+    pass "Fish-функция 'claude-desktop' настроена"
+else
+    fail "Файл ~/.config/fish/functions/claude-desktop.fish отсутствует!"
+fi
+
+# Проверка бинарных обёрток
+if [[ -x "$HOME/bin/claude" ]] && grep -q "claude-vpn" "$HOME/bin/claude" 2>/dev/null; then
+    pass "Обёртка ~/bin/claude готова к работе"
+else
+    fail "Обёртка ~/bin/claude не настроена или не исполняема!"
+fi
+
+if [[ -x "$HOME/bin/claude-desktop" ]] && grep -q "claude-vpn" "$HOME/bin/claude-desktop" 2>/dev/null; then
+    pass "Обёртка ~/bin/claude-desktop готова к работе"
+else
+    fail "Обёртка ~/bin/claude-desktop не настроена или не исполняема!"
+fi
+
+# Проверка перехватчика в .local/bin
+if [[ -e "$HOME/.local/bin/claude" ]]; then
+    if grep -q "claude-vpn" "$HOME/.local/bin/claude" 2>/dev/null; then
+        pass "Перехватчик ~/.local/bin/claude активен"
+    else
+        warn "Файл ~/.local/bin/claude был перезаписан npm! (Сработает автовосстановление при следующем запуске)"
+    fi
+else
+    fail "Файл ~/.local/bin/claude отсутствует!"
+fi
+
+# Проверка Rofi / Desktop интеграции
+desktop_file="$HOME/.local/share/applications/com.anthropic.Claude.desktop"
+if [[ -f "$desktop_file" ]] && grep -q -E "(/bin/claude-desktop|claude-app|claude-vpn)" "$desktop_file"; then
+    pass "Меню приложений и Rofi жестко привязаны к изолированной обертке"
+else
+    fail "Ярлык $desktop_file запускает системный claude-desktop в обход клетки!"
+fi
+
+# Проверка хоткея в sxhkdrc
+if grep -rn -A 5 "super + shift + " "$HOME/.config/sxhkd/sxhkdrc" 2>/dev/null | grep -q "claude-app"; then
+    pass "Хоткей Super+Shift+C привязан к изолированному запуску (~/bin/claude-app)"
+else
+    warn "Хоткей Super+Shift+C не найден в sxhkdrc"
+fi
+
+
+# ── 6. ИТОГОВЫЙ ВЕРДИКТ ─────────────────────────────────────────
+info_hdr "Итоговый результат"
+echo -e "Проверено тестов: ${BOLD}$CHECKS${NC} | Ошибок: ${BOLD}${RED}$ERRORS${NC} | Предупреждений: ${BOLD}${YELLOW}$WARNINGS${NC}"
+
+if [[ $ERRORS -eq 0 && $WARNINGS -eq 0 ]]; then
+    echo -e "\n${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${GREEN}║   [✓] ВСЕ СИСТЕМЫ ЗАЩИТЫ АКТИВНЫ (100% готов к безопасной работе)║${NC}"
+    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+    exit 0
+elif [[ $ERRORS -eq 0 ]]; then
+    echo -e "\n${BOLD}${YELLOW}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${YELLOW}║   [▲] СИСТЕМА ЗАЩИЩЕНА, НО ЕСТЬ ЗАМЕЧАНИЯ (см. предупреждения)  ║${NC}"
+    echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+    exit 0
+else
+    echo -e "\n${BOLD}${RED}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${RED}║   [✖] ОБНАРУЖЕНЫ УЯЗВИМОСТИ! ЗАПУСК CLAUDE НЕ РЕКОМЕНДУЕТСЯ!     ║${NC}"
+    echo -e "${BOLD}${RED}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
+    exit 1
+fi

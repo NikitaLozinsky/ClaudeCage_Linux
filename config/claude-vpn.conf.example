@@ -1,0 +1,14 @@
+# ============================================================
+# ClaudeCage Configuration File
+# Location: /etc/claude-vpn.conf or ~/.config/claude-vpn.conf
+# ============================================================
+
+# Target VPN Network Interface (default: amn0)
+# Examples: WireGuard (wg0), OpenVPN (tun0), AmneziaVPN (amn0), ProtonVPN (proton0)
+VPN_IFACE="amn0"
+
+# Target VPN DNS Resolver (default: 100.64.0.1 for Amnezia, 1.1.1.1 or 10.2.0.1 for WireGuard)
+VPN_DNS="100.64.0.1"
+
+# Environment Timezone for Antifraud Protection (must match your VPN server exit location)
+CLAUDE_TZ="Europe/Amsterdam"
