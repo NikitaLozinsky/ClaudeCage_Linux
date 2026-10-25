@@ -1,144 +1,103 @@
 # 🛡️ ClaudeCage (Linux)
 
-> **Military-grade, kernel-level network isolation sandbox & anti-leak jail for Claude Code (CLI) and Claude Desktop (Electron) on Linux.**
+> **Многоуровневая эшелонированная оборона на уровне ядра Linux для Claude Code (CLI) и Claude Desktop (Electron). 100% защита от антифрода Anthropic, аппаратный Kill Switch и нулевая утечка реального IP, DNS, WebRTC и геолокации.**
 
 [![Platform](https://img.shields.io/badge/Platform-Linux%20(Arch%20%7C%20Debian%20%7C%20Fedora%20%7C%20Ubuntu)-blue.svg?logo=linux)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![Security](https://img.shields.io/badge/Security-Hardened%20Kill%20Switch-success.svg?logo=securityscorecard)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![Isolation](https://img.shields.io/badge/Isolation-Netns%20%2B%20bwrap%20%2B%20D--Bus%20Jail-orange.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
+[![Diagnostics](https://img.shields.io/badge/Diagnostics-celltest%2020%2F20%20PASS-brightgreen.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
 
-## 📖 Содержание / Table of Contents
+## 🚀 1. Как устроен ClaudeCage и почему это круто
 
-- [Что это такое? / Overview](#-что-это-такое--overview)
-- [Проблема антифрода Anthropic / The Threat Model](#-проблема-антифрода-anthropic--the-threat-model)
-- [Архитектура защиты (5 эшелонов) / 5-Layer Defense Architecture](#-архитектура-защиты-5-эшелонов--5-layer-defense-architecture)
-- [Интерактивные диаграммы / Diagrams](#-интерактивные-диаграммы--diagrams)
-- [Установка за 1 минуту / Quick Installation](#-установка-за-1-минуту--quick-installation)
-- [Комплексная диагностика (`celltest`) / Diagnostics](#-комплексная-диагностика-celltest--diagnostics)
-- [Использование / Usage Guide](#-использование--usage-guide)
-- [Конфигурация / Configuration](#-конфигурация--configuration)
-- [Безопасность и аудит / Security & Audit](#-безопасность-и-аудит--security--audit)
-- [Лицензия / License](#-лицензия--license)
-
----
-
-## 🎯 Что это такое? / Overview
-
-**ClaudeCage** — это специализированная среда изоляции для Linux, предотвращающая блокировки аккаунтов Anthropic (Claude Pro / Team / Max / API) и утечки реального IP-адреса, DNS, WebRTC, D-Bus и локального времени хоста.
-
-Система объединяет изоляцию на уровне пространства имён ядра Linux (`ip netns`), аппаратный сетевой фильтр `nftables`, монтирование изолированной файловой системы (`bubblewrap`), частную сессионную шину (`dbus-run-session`) и демона реального времени (`Netlink Watchdog`).
-
----
-
-## ⚠️ Проблема антифрода Anthropic / The Threat Model
-
-Использование стандартного системного VPN на Linux для работы с Claude таит в себе скрытые векторы утечек:
-
-1. **Conntrack Session Bleed (Утечка при обрыве VPN)**: Если VPN падает, ядро Linux переключает маршрут по умолчанию на `wlan0`/`eth0`. Уже открытые TCP-сессии (`ct state established`) продолжают слать пакеты через провайдера без шифрования, мгновенно выдавая ваш реальный IP антифроду Anthropic.
-2. **DNS & DoH Leaks (Утечки DNS)**: Системный `systemd-resolved` или локальный резолвер хоста обращается к DNS-серверам провайдера. Electron также может использовать встроенный DoH (DNS over HTTPS).
-3. **WebRTC Local Candidate Leaks**: Electron и Chromium опрашивают локальные сетевые адаптеры через WebRTC, передавая внешний и локальный IP хоста.
-4. **D-Bus Portal Escape (Утечка через порталы)**: При переходе по ссылкам (`shell.openExternal()`) Electron обращается к сервису `xdg-desktop-portal` через сессионный D-Bus хоста, открывая ссылку в браузере хоста **вне VPN**.
-5. **Keyring & Timezone Anti-Fraud Mismatch**: Несоответствие между часовым поясом (`Intl.DateTimeFormat`) и IP-геолокацией VPN-сервера — один из ключевых триггеров банов в антифроде Anthropic.
-
----
-
-## 🛡️ Архитектура защиты (5 эшелонов) / 5-Layer Defense Architecture
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                   ЭШЕЛОН 1: Сетевое пространство netns                │
-│       Виртуальный кабель veth_host (10.200.1.1) <-> veth_ns (10.200.1.2)│
-│       Отсутствие физического доступа к сетевым картам хоста (wlan0)   │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                 ЭШЕЛОН 2: Аппаратный Kill Switch nftables              │
-│       • Правило DROP стоит ВЫШЕ ct state established,related           │
-│       • Динамический MSS Clamping (rt mtu) по пути следования пакетов  │
-│       • Принудительный DNAT всех DNS-запросов (порт 53) в туннель VPN  │
-│       • Блокировка доступа клетки к портам хоста (input isolation)     │
-│       • Полное отключение IPv6 внутри клетки (disable_ipv6 = 1)        │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│            ЭШЕЛОН 3: Файловая система и сокеты (bubblewrap)            │
-│       • Сброс root-прав через setpriv ДО входа в контейнер             │
-│       • Сокрытие системного D-Bus (/run/dbus) и DNS-стаба resolved     │
-│       • Сокрытие сокетов пользовательского systemd хоста (защита от RCE)│
-│       • Частная шина dbus-run-session с маскированием порталов         │
-│       • Базовое хранилище сессий Electron (--password-store=basic)     │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│             ЭШЕЛОН 4: Фоновый сторожевой демон (Netlink Watchdog)      │
-│       • Мониторинг ядра в реальном времени через Netlink сокет         │
-│       • Атомарная блокировка flock без утечки файловых дескрипторов    │
-│       • Сброс маршрута и внешних сокетов: ss -K dst != 127.0.0.0/8     │
-│       • Сохранение loopback 127.0.0.1 для MCP-серверов и локального IPC│
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│         ЭШЕЛОН 5: Перехват внешних ссылок и защита браузера            │
-│       • Подмена xdg-open на скрипт-ловушку xdg-open-jail               │
-│       • Принудительное копирование URL в системный буфер (xclip)       │
-│       • Отправка системного баннера на хост (notify-send / dunst)      │
-│       • Запрет запуска браузера хоста вне защищенного периметра        │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📊 Интерактивные диаграммы / Diagrams
-
-### Архитектура периметра изоляции
+Внутри **ClaudeCage** реализована многоуровневая эшелонированная оборона на уровне ядра операционной системы Linux. Все процессы Claude изолируются в отдельном сетевом пространстве (`ip netns`), запускаются внутри песочницы монтирования (`bubblewrap`) с собственной шиной D-Bus, а трафик фильтруется аппаратным брандмауэром `nftables`:
 
 ```mermaid
 flowchart TD
-    subgraph Host["Хостовая операционная система (Linux Host)"]
-        WLAN["Физический адаптер: wlan0 / eth0 (Реальный IP)"]
-        VPN["VPN Интерфейс: amn0 / wg0 / tun0 (Защищённый IP)"]
-        DUNST["Демон уведомлений хоста (dunst / polybar / desktop)"]
-        X11["X11 / Wayland сервер"]
-        
-        subgraph Netfilter["nftables (таблица inet claude_vpn_nat)"]
-            KS["Аппаратный Kill Switch (iif veth_host oif != VPN DROP)"]
-            MSS["Динамический TCP MSS Clamping (rt mtu)"]
-            DNAT["Принудительный DNAT DNS -> VPN:53"]
-            NAT["Masquerade трафика клетки в VPN интерфейс"]
-        end
-        
-        WD["Watchdog Loop (Netlink Monitor + flock)"]
+    subgraph App["📦 Процессы Claude (Desktop Electron, Code CLI, Node.js, MCP)"]
+        CL["claude / claude-desktop"]
     end
 
-    subgraph Jail["Сетевое пространство ClaudeCage (ip netns claude_vpn)"]
-        VETH_NS["veth_ns (10.200.1.2/24)"]
-        LO["Loopback 127.0.0.1 (Жив при падении VPN: MCP / IPC)"]
-        
-        subgraph Sandbox["Контейнер bubblewrap + dbus-run-session"]
-            APP_CLI["Claude Code (Node.js CLI)"]
-            APP_GUI["Claude Desktop (Electron GUI)"]
-            XDG["xdg-open-jail (Перехватчик внешних URL)"]
-        end
+    subgraph Defense["🛡️ Ядро безопасности ClaudeCage (Linux Kernel Sandbox)"]
+        TZ["🕒 Спуфинг таймзоны (TZ = Europe/Amsterdam)"]
+        RTC["🚫 Анти-WebRTC & DoH Chromium Flags"]
+        BWRAP["📦 Песочница bwrap (Изоляция /run/dbus, resolved и systemd --user)"]
+        DBUS["🔒 Изолированная шина D-Bus (dbus-run-session + перехватчик xdg-open-jail)"]
+        NETNS["🌐 Сетевой стек ядра (ip netns claude_vpn + veth 10.200.1.0/24)"]
+        NFT["🧱 24/7 Аппаратный Kill Switch nftables (Drop выше ct established)"]
+        DNAT["📋 Принудительный DNAT DNS (Порт 53 -> Резолвер VPN)"]
+        WD["👁️ Netlink Watchdog (Мониторинг amn0/wg0 + сброс внешних сокетов ss -K)"]
     end
 
-    VETH_HOST["veth_host (10.200.1.1)"]
+    subgraph Net["🌐 Сетевые интерфейсы хоста"]
+        VPN["🟢 VPN-туннель (WireGuard / Amnezia / OpenVPN / Proton)"]
+        ETH["🔴 Физический адаптер хоста (Wi-Fi wlan0 / Ethernet eth0)"]
+    end
 
-    Jail <-->|"Виртуальный кабель (veth pair)"| VETH_HOST
-    VETH_HOST --> Netfilter
-    Netfilter -->|"Разрешено"| VPN
-    Netfilter -.->|"Заблокировано (DROP)"| WLAN
-    VPN -->|"Шифрованный туннель"| ANTHROPIC["Серверы Anthropic API"]
-    
-    WD -.->|"Слушает Netlink ядра"| VPN
-    WD -.->|"Сброс маршрута и внешних сокетов"| Jail
+    CL --> TZ --> RTC --> BWRAP --> DBUS --> NETNS --> NFT
+    NETNS -.->|"DNS-запросы"| DNAT
 
-    XDG -->|"Копирование ссылки"| X11
-    XDG -->|"Desktop уведомление"| DUNST
+    NFT -->|"Разрешено: трафик строго в туннель"| VPN
+    NFT x--x|"Заблокировано: попытка выхода через физический IP (0 мс DROP)"| ETH
+    DNAT -->|"DNS строго через адрес туннеля"| VPN
+    DNAT x--x|"Блокировка: DNS хоста недоступен"| ETH
+
+    WD -.->|"Слушает Netlink-события ядра"| VPN
+    WD -.->|"Сброс маршрута и внешних сокетов"| NETNS
+
+    VPN -->|"Безопасный зашифрованный выход"| Internet["🌍 Серверы Anthropic API"]
 ```
 
-### Поведение при обрыве туннеля VPN (Hard Kill Switch)
+---
+
+## ⚠️ 2. Модель угроз: почему обычного VPN недостаточно под Linux
+
+Использование стандартного системного VPN-клиента на рабочей станции Linux несёт в себе скрытые векторы деанонимизации для антифрод-систем Anthropic:
+
+1. **Conntrack Session Bleed (Утечка при обрыве туннеля)**:  
+   При падении VPN ядро Linux мгновенно переключает маршрут по умолчанию на `wlan0`/`eth0`. Уже открытые TCP-сессии (`ct state established`) продолжают слать пакеты через реального провайдера в обход туннеля. Антифрод Anthropic видит смену IP посреди сессии и отправляет аккаунт в бан.
+2. **DNS & DoH Leaks (Утечки резолвинга)**:  
+   Служба `systemd-resolved` или локальный кэширующий DNS хоста может резолвить домены через DNS-серверы провайдера. Встроенный в Electron механизм DoH (DNS over HTTPS) также способен обходить системный туннель.
+3. **WebRTC Local Candidate Leaks**:  
+   Chromium/Electron опрашивает сетевые интерфейсы через WebRTC, передавая внешний и локальный IP-адрес хоста даже при активном VPN.
+4. **D-Bus Portal Bypass (Утечка через браузер хоста)**:  
+   При переходе по внешним ссылкам (авторизация, документация) Electron обращается к сервису `xdg-desktop-portal` через сессионный D-Bus хоста, открывая ссылку в основном браузере хоста **вне защищенного туннеля**.
+5. **Keyring & Timezone Anti-Fraud Mismatch**:  
+   Несоответствие между системным временем (`Intl.DateTimeFormat`) и геолокацией VPN-сервера — мгновенный триггер для антифрода.
+
+---
+
+## 🛡️ 3. Пять эшелонов обороны ядра
+
+### Эшелон 1: Сетевой Namespace ядра (`ip netns`)
+Процессы Claude помещаются в изолированное сетевое пространство `claude_vpn`. У них **физически отсутствуют** адаптеры `wlan0`, `eth0` или Docker-мосты. Связь с хостом происходит исключительно по виртуальному патч-корду `veth_host (10.200.1.1) <-> veth_ns (10.200.1.2)`. IPv6 внутри клетки аппаратно отключен (`disable_ipv6=1`), исключая утечки через IPv6 SLAAC/DHCPv6.
+
+### Эшелон 2: Аппаратный сетевой фильтр `nftables` (Hard Kill Switch)
+- **DROP выше conntrack**: Правило сброса `iifname "veth_host" oifname != "$VPN_IFACE" drop` расположено **строго выше** `ct state established,related accept`. Даже если маршрут упал, ни один существующий сокет не просочится на хост.
+- **Динамический MSS Clamping**: Правило `tcp flags syn tcp option maxseg size set rt mtu` динамически подстраивает размер TCP-сегмента под реальный MTU туннеля, устраняя фрагментацию и PMTUD-утечки.
+- **Принудительный DNAT DNS**: Любые DNS-запросы (порт 53 UDP/TCP) принудительно перенаправляются на доверенный резолвер VPN (`100.64.0.1` или настроенный `VPN_DNS`).
+- **Изоляция Input**: Клетка изолирована от локальных портов хоста (`10.200.1.1` и сервисов `localhost`).
+
+### Эшелон 3: Песочница файловой системы и сокетов (`bubblewrap` + `setpriv`)
+- **Безопасный сброс привилегий**: `setpriv` сбрасывает UID/GID до непривилегированного пользователя с очисткой возможностей (`--inh-caps=-all`) **до** входа в `bwrap`, исключая ошибки `setgroups failed` и LPE-векторы.
+- **Сокрытие сокетов хоста**: Системный `/run/dbus`, `/run/systemd/resolve` и сокет пользовательского systemd (`${XDG_RUNTIME}/systemd`) скрываются через изолированные tmpfs.
+- **Хранилище сессий**: Флаг `--password-store=basic` предотвращает потерю сессии Claude Desktop при отсутствии системного D-Bus keyring (`gnome-keyring` / `kwallet`).
+
+### Эшелон 4: Автономный сессионный D-Bus и изоляция порталов
+- Приложение запускается через `dbus-run-session`, поднимая чистую сессионную шину без сервисов хоста.
+- Файл автоактивации портала `/usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service` подменяется на `/dev/null`. Вызовы порталов возвращают `ServiceUnknown`, заставляя Electron использовать безопасный фолбэк на `xdg-open`.
+- Выставлены переменные среды `GTK_USE_PORTAL=0 GDK_DEBUG=no-portals`.
+
+### Эшелон 5: Watchdog демон реального времени (Netlink)
+- Фоновый демон слушает события ядра через Netlink (`ip monitor link route`).
+- Исключена утечка файловых дескрипторов `flock`: закрытие дескриптора в подпроцессе гарантирует мгновенный и чистый перезапуск клетки.
+- При падении туннеля VPN вызывается `ss -K dst != 127.0.0.0/8`: ядро мгновенно рвёт внешние соединения, но **сохраняет loopback `127.0.0.1`**, гарантируя бесперебойную работу локальных MCP-серверов и IPC Claude Code.
+
+---
+
+## ⚡ 4. Поведение при обрыве связи (Hard Kill Switch в действии)
 
 ```mermaid
 sequenceDiagram
@@ -147,64 +106,60 @@ sequenceDiagram
     participant Netns as netns claude_vpn
     participant NFT as nftables (Kill Switch)
     participant WD as Watchdog Демон
-    participant VPN as VPN (amn0 / wg0)
-    participant HostNet as Host Network (wlan0)
+    participant VPN as VPN-туннель (amn0/wg0)
+    participant HostNet as Хостовый адаптер (wlan0)
 
     App->>Netns: Исходящий запрос к api.anthropic.com
     Netns->>NFT: Пакет через veth_host
     NFT->>VPN: Перенаправление в туннель VPN (Разрешено)
-    VPN-->>App: Ответ от Anthropic (Сессия работает)
+    VPN-->>App: Ответ от Anthropic (Сессия активна)
 
     Note over VPN: Происходит обрыв соединения VPN!
-    VPN--xNFT: Интерфейс amn0/wg0 деактивирован
+    VPN--xNFT: Интерфейс туннеля отключён / упал
 
     App->>Netns: Попытка отправить пакет в существующую сессию
     Netns->>NFT: Пакет через veth_host
     NFT->>NFT: iif veth_host oif != VPN DROP (Выше conntrack established!)
-    NFT--xHostNet: БЛОКИРОВКА! 0 байт уходит в wlan0
+    NFT--xHostNet: АППАРАТНАЯ БЛОКИРОВКА! 0 байт уходит в wlan0
 
-    WD->>WD: Обнаружено событие Netlink (ip monitor)
+    WD->>WD: Обнаружено событие ядра Netlink (ip monitor)
     WD->>Netns: Удаление маршрута default
-    WD->>Netns: ss -K dst != 127.0.0.0/8 (Сброс внешних сокетов)
-    Note over Netns: Локальный loopback 127.0.0.1 сохранён для MCP-серверов
+    WD->>Netns: ss -K dst != 127.0.0.0/8 (Мгновенный разрыв внешних сокетов)
+    Note over Netns: Локальный сокет 127.0.0.1 сохранён для работы MCP-серверов!
 ```
 
 ---
 
-## 🚀 Установка за 1 минуту / Quick Installation
+## 📦 5. Быстрый старт и установка за 1 минуту
 
-### 1. Клонирование репозитория
+### Требования
+- Linux-дистрибутив с ядром $\ge$ 5.4 (Arch Linux, Debian, Ubuntu, Fedora, Manjaro и др.)
+- Установленные утилиты: `iproute2`, `nftables`, `bubblewrap`, `util-linux`, `xclip`, `libnotify`, `dbus`
+
+### Установка
 
 ```bash
 git clone https://github.com/NikitaLozinsky/ClaudeCage_Linux.git
 cd ClaudeCage_Linux
-```
-
-### 2. Запуск автоматического установщика
-
-```bash
 ./install.sh
 ```
 
-Скрипт автоматически:
-- Проверит системные зависимости (`iproute2`, `nftables`, `bubblewrap`, `util-linux`, `xclip`, `libnotify`).
-- Установит системный оркестратор в `/usr/local/bin/claude-vpn` и перехватчик в `/usr/local/lib/claude-vpn/`.
-- Сконфигурирует безопасный `sudoers` без ввода пароля (`!use_pty`, защита от LPE).
-- Определит активный VPN-интерфейс (`amn0`, `wg0`, `tun0`, `proton0`).
-- Настроит обёртки для консольного и оконного Claude в `~/.local/bin/`.
-- Установит ярлык для меню приложений (Rofi, GNOME, KDE, XFCE).
+Инсталлятор в автоматическом режиме:
+1. Проверит наличие всех необходимых зависимостей.
+2. Установит системный оркестратор `/usr/local/bin/claude-vpn` с правами `root:root 0755`.
+3. Сконфигурирует безопасный `sudoers` без ввода пароля (`!use_pty`, защита от LPE).
+4. Определит ваш активный VPN-интерфейс (`amn0`, `wg0`, `tun0`, `proton0`).
+5. Настроит прозрачные обёртки в `~/.local/bin/` и интеграции для Fish-шелла и меню приложений.
 
 ---
 
-## 🩺 Комплексная диагностика (`celltest`) / Diagnostics
+## 🩺 6. Комплексная диагностика (`celltest`)
 
-Для мгновенной проверки герметичности песочницы включена утилита **`celltest`**, которая проверяет 20 параметров системы по 5 категориям:
+Для полной уверенности в неуязвимости системы в репозиторий включена диагностическая утилита **`celltest`**, проверяющая **20 параметров** по 5 ключевым категориям:
 
 ```bash
 celltest
 ```
-
-Пример вывода:
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
@@ -250,62 +205,57 @@ celltest
 
 ---
 
-## 💻 Использование / Usage Guide
+## 💻 7. Повседневное использование и CLI-команды
 
-После установки вы можете использовать Claude как обычно — клетка прозрачно оборачивает вызовы:
+После установки использование Claude происходит привычным образом — скрипты прозрачно перехватывают вызовы:
 
 ```bash
-# Запуск Claude Code CLI (терминал)
+# Запуск Claude Code CLI (консольная версия)
 claude
 
-# Запуск десктопного приложения
+# Запуск десктопного приложения Claude Desktop
 claude-desktop
 
-# Выполнение любой произвольной команды внутри изолированной клетки
+# Выполнение любой утилиты внутри изолированной клетки
 claude-vpn exec -- ping -c 1 127.0.0.1
 claude-vpn exec -- curl https://icanhazip.com
 
-# Ручное управление клеткой
-claude-vpn --status      # Показать подробный статус сети, MTU и маршрутов
-claude-vpn --up          # Поднять клетку и Kill Switch вручную
-claude-vpn --down        # Полная очистка правил и удаление netns
+# Служебные команды оркестратора
+claude-vpn --status      # Подробный статус туннеля, netns, MTU и маршрутов
+claude-vpn --up          # Принудительное поднятие сети клетки
+claude-vpn --down        # Полная очистка правил nftables и удаление netns
 ```
 
 ---
 
-## ⚙️ Конфигурация / Configuration
+## ⚙️ 8. Конфигурация (`claude-vpn.conf`)
 
-Конфигурационный файл расположен в `~/.config/claude-vpn.conf` (или системный `/etc/claude-vpn.conf`):
+Конфигурационный файл создаётся автоматически в `~/.config/claude-vpn.conf` (или глобальный в `/etc/claude-vpn.conf`):
 
 ```ini
-# Имя интерфейса вашего VPN соединения (default: amn0)
+# Сетевой интерфейс вашего VPN-клиента (default: amn0)
+# Поддерживаются: amn0 (Amnezia), wg0 (WireGuard), tun0 (OpenVPN), proton0 (ProtonVPN)
 VPN_IFACE="amn0"
 
-# Изолированный DNS резолвер VPN
+# Адрес изолированного DNS-резолвера туннеля
 VPN_DNS="100.64.0.1"
 
-# Часовой пояс (должен совпадать с локацией IP-адреса VPN)
+# Эмулируемый часовой пояс (должен соответствовать локации вашего VPN)
 CLAUDE_TZ="Europe/Amsterdam"
 ```
 
 ---
 
-## 🔒 Безопасность и аудит / Security & Audit
+## 🔒 9. Безопасность и защита от LPE
 
-1. **Защита от повышения привилегий (LPE)**:
-   - Основной скрипт хранится в `/usr/local/bin/claude-vpn` с правами `root:root 0755`.
-   - В sudoers выставлена директива `!use_pty`, защищающая от перехвата терминала через TIOCSTI.
-   - Пользовательские конфигурационные файлы парсятся регулярными выражениями **без использования команды `source`**.
-2. **Сброс привилегий в mntns**:
-   - `setpriv` понижает привилегии до реального UID пользователя **до** входа в `bubblewrap`, что исключает блокировки прав capability ядра Linux.
-3. **Сохранение локального Loopback и сигналов**:
-   - Сигналы изменения размера терминала (`SIGWINCH`), прерывания (`SIGINT`) и пайпы передаются процессам напрямую без промежуточных sudo-оболочек.
-   - Сброс соединений при падении VPN (`ss -K`) затрагивает только внешние сокеты (`dst != 127.0.0.0/8`), сохраняя работоспособность локальных MCP-серверов.
+- **Исключение LPE (Local Privilege Escalation)**: Оркестратор расположен в системной директории `/usr/local/bin/claude-vpn` с владельцем `root:root` и правами `0755`. В конфигурации `sudoers` директива `!use_pty` блокирует атаки внедрения команд через TTY (TIOCSTI).
+- **Безопасный парсинг**: Параметры из пользовательских файлов конфигурации извлекаются с помощью строгой регулярной фильтрации **без использования команды `source`**.
+- **Сохранение интерактивности TTY**: Прямой вызов `exec` без промежуточных sudo-оболочек сохраняет обработку сигналов `SIGWINCH` (ресайз окна терминала) и `SIGINT` (Ctrl+C).
 
 ---
 
-## 📄 Лицензия / License
+## 📄 10. Лицензия и копирайт
 
-Проект распространяется под открытой лицензией [MIT](LICENSE).
-Автор: **Nikita Lozinsky**
-Code and Architecture contributions: **Google DeepMind Antigravity Pair-Programming Agent**.
+Проект распространяется под свободной лицензией [MIT](LICENSE).  
+Автор: **Nikita Lozinsky**  
+Код и архитектурные решения: **Google DeepMind Antigravity Pair-Programming Agent**.
