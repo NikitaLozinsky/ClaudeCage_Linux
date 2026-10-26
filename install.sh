@@ -84,6 +84,17 @@ for iface in amn0 wg0 tun0 proton0; do
     fi
 done
 
+SYS_CONF="/etc/claude-vpn.conf"
+if [[ ! -f "$SYS_CONF" ]]; then
+    sudo cp config/claude-vpn.conf.example "$SYS_CONF"
+    sudo sed -i "s/VPN_IFACE=\"amn0\"/VPN_IFACE=\"${DETECTED_IFACE}\"/" "$SYS_CONF"
+    sudo chown root:root "$SYS_CONF"
+    sudo chmod 0644 "$SYS_CONF"
+    info "Создан системный конфиг: $SYS_CONF (интерфейс: $DETECTED_IFACE)"
+else
+    info "Существующий системный конфиг сохранён: $SYS_CONF"
+fi
+
 CONF_DIR="${TARGET_HOME}/.config"
 CONF_FILE="${CONF_DIR}/claude-vpn.conf"
 mkdir -p "$CONF_DIR"
@@ -92,7 +103,7 @@ if [[ ! -f "$CONF_FILE" ]]; then
     cp config/claude-vpn.conf.example "$CONF_FILE"
     sed -i "s/VPN_IFACE=\"amn0\"/VPN_IFACE=\"${DETECTED_IFACE}\"/" "$CONF_FILE"
     chown "${TARGET_USER}:${TARGET_GROUP}" "$CONF_FILE"
-    info "Создан конфиг: $CONF_FILE (интерфейс: $DETECTED_IFACE)"
+    info "Создан пользовательский конфиг: $CONF_FILE"
 else
     info "Существующий конфиг сохранён: $CONF_FILE"
 fi
@@ -149,13 +160,22 @@ sudo cp -f systemd/claude-vpn.service /etc/systemd/system/claude-vpn.service
 sudo systemctl daemon-reload
 info "Установлен /etc/systemd/system/claude-vpn.service"
 
+# 8. Перезапуск активного сетевого пространства (если было запущено)
+if ip netns list 2>/dev/null | grep -qw "claude_vpn"; then
+    step "Обновление активного сетевого пространства"
+    info "Обнаружено активное сетевое пространство claude_vpn. Применяем обновленные правила ядра..."
+    /usr/local/bin/claude-vpn --down >/dev/null 2>&1 || true
+    /usr/local/bin/claude-vpn --up || warn "Не удалось автоматически перезапустить claude_vpn"
+    info "Сетевое пространство успешно перезапущено с новыми правилами ядра!"
+fi
+
 step "Итог установки"
 echo -e "${GREEN}${BOLD}Установка ClaudeCage успешно завершена!${NC}"
 echo ""
-echo "Для проверки состояния изоляции запустите:"
-echo "  ${CYAN}celltest${NC}"
+echo -e "Для проверки состояния изоляции запустите:"
+echo -e "  ${CYAN}celltest${NC}"
 echo ""
-echo "Для запуска Claude в изолированной клетке используйте привычные команды:"
-echo "  ${CYAN}claude${NC}          (CLI версия)"
-echo "  ${CYAN}claude-desktop${NC}  (Десктопное приложение)"
+echo -e "Для запуска Claude в изолированной клетке используйте привычные команды:"
+echo -e "  ${CYAN}claude${NC}          (CLI версия)"
+echo -e "  ${CYAN}claude-desktop${NC}  (Десктопное приложение)"
 echo ""

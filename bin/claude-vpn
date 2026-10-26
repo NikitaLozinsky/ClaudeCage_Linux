@@ -1,24 +1,23 @@
 #!/bin/bash
-# ============================================================
+# ==============================================================================
 # claude-vpn — Hardened Network Jail for Claude (CLI & GUI)
 #
 # Режимы работы:
-#   claude-vpn --up               Поднять netns, veth, nftables и watchdog (фон)
+#   claude-vpn --up               Поднять netns, veth, policy routing, nftables и watchdog (фон)
 #   claude-vpn --down             Полностью удалить netns, правила и watchdog
 #   claude-vpn <приложение>       Запустить приложение в изолированном netns
-#   claude-vpn --status           Статус netns, VPN и watchdog
+#   claude-vpn --status           Статус netns, VPN, routing и watchdog
 #
-# Особенности безопасности:
-#   - Защита от LPE: root-бинарник в /usr/local/bin, безопасный парсинг конфигов
-#   - Жесткий Kill Switch: iif veth_host oif != amn0 drop выше ct established
-#   - Защита Input хоста: изоляция локальных портов хоста от клетки
-#   - Перехват DNS: dnat порт 53 на DNS AmneziaVPN (100.64.0.1)
-#   - Динамический MSS: clamp rt mtu для туннеля без оверхеда
-#   - bwrap изоляция: скрытие /run/dbus, /run/systemd/resolve и подмена xdg-open
-#   - Watchdog: Netlink event monitor + flock + сброс сокетов (ss -K)
-#   - Прямой exec + setpriv: сохранение TTY сигналов (SIGWINCH/SIGINT)
-#   - Полная изоляция IPv6 (disable_ipv6=1)
-# ============================================================
+# Особенности безопасности (Эшелонированная оборона):
+#   - Двухуровневый Fail-Closed: Policy Routing (table 200) + Аппаратный nftables
+#   - Атомарная транзакция nftables: исключено окно без файрвола при старте/реконнекте
+#   - Изоляция сессионной шины: маскировка ${XDG_RUNTIME}/bus, systemd --user, gnupg
+#   - Защита от LPE и подмены маршрутов: критичные ключи только из /etc/claude-vpn.conf
+#   - Dynamic MSS: clamp rt mtu для туннеля без фрагментации
+#   - Reconcile Watchdog: Netlink link monitor + liveness-проба + авто-исцеление nftables
+#   - Безопасный сброс сокетов (ss -K): уничтожение внешних TCP/UDP без сброса 127.0.0.1
+#   - Полная изоляция IPv6 (disable_ipv6=1 на netns и veth_host)
+# ==============================================================================
 set -uo pipefail
 
 # ── Определение путей и конфигурация ────────────────────────
@@ -30,30 +29,53 @@ SUBNET="10.200.1"
 HOST_IP="${SUBNET}.1"
 NS_IP="${SUBNET}.2"
 PREFIX="24"
-VPN_IFACE="${CLAUDE_VPN_IFACE:-amn0}"
-VPN_DNS="${CLAUDE_VPN_DNS:-100.64.0.1}"
+RT_TABLE=200
+RT_PRIO=100
+DEFAULT_MTU=1376
+NFT_TABLE="claude_vpn_nat"
+PID_FILE="/run/claude_vpn_watchdog.pid"
+ORIG_FWD_FILE="/run/claude_vpn_orig_ip_forward"
+JAIL_XDG_OPEN="/usr/local/lib/claude-vpn/xdg-open-jail"
+
+# Определение пользователя и домашней директории
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || who -m 2>/dev/null | awk '{print $1}' || id -un)}"
 REAL_UID=$(id -u "$REAL_USER" 2>/dev/null || echo 1000)
 REAL_GID=$(id -g "$REAL_USER" 2>/dev/null || echo 1000)
-REAL_HOME=$(eval echo "~${REAL_USER}")
-
-# Чтение глобального и пользовательского конфигов
-for _c in "/etc/claude-vpn.conf" "${REAL_HOME}/.config/claude-vpn.conf"; do
-    if [[ -f "$_c" ]]; then
-        _v=$(grep -E "^VPN_IFACE=" "$_c" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
-        [[ -n "$_v" ]] && VPN_IFACE="$_v"
-        _v=$(grep -E "^VPN_DNS=" "$_c" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
-        [[ -n "$_v" ]] && VPN_DNS="$_v"
-    fi
-done
+REAL_HOME=$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)
+[[ -z "$REAL_HOME" ]] && REAL_HOME="/home/${REAL_USER}"
 XDG_RUNTIME="/run/user/${REAL_UID}"
-NFT_TABLE="claude_vpn_nat"
-PID_FILE="/run/claude_vpn_watchdog.pid"
-DNS_AMNEZIA="100.64.0.1"
-DEFAULT_MTU=1376
-JAIL_XDG_OPEN="/usr/local/lib/claude-vpn/xdg-open-jail"
 
-# ── Цвета ───────────────────────────────────────────────────
+# Конфигурация по умолчанию
+VPN_IFACE="amn0"
+VPN_DNS="100.64.0.1"
+CLAUDE_TZ="Europe/Amsterdam"
+
+# 1. Чтение системного доверенного конфига root (/etc/claude-vpn.conf)
+# КРИТИЧНЫЕ СЕТЕВЫЕ КЛЮЧИ ЧИТАЮТСЯ ТОЛЬКО ОТСЮДА!
+if [[ -f "/etc/claude-vpn.conf" ]]; then
+    _v=$(grep -E "^VPN_IFACE=" "/etc/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    if [[ "$_v" =~ ^[a-z0-9_.-]{1,15}$ ]]; then
+        VPN_IFACE="$_v"
+    fi
+    _v=$(grep -E "^VPN_DNS=" "/etc/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    if [[ "$_v" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        VPN_DNS="$_v"
+    fi
+    _v=$(grep -E "^CLAUDE_TZ=" "/etc/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    if [[ "$_v" =~ ^[A-Za-z0-9_+-]+/[A-Za-z0-9_+-]+$ ]]; then
+        CLAUDE_TZ="$_v"
+    fi
+fi
+
+# 2. Пользовательский конфиг: считываем ИСКЛЮЧИТЕЛЬНО CLAUDE_TZ
+if [[ -f "${REAL_HOME}/.config/claude-vpn.conf" ]]; then
+    _v=$(grep -E "^CLAUDE_TZ=" "${REAL_HOME}/.config/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    if [[ "$_v" =~ ^[A-Za-z0-9_+-]+/[A-Za-z0-9_+-]+$ ]]; then
+        CLAUDE_TZ="$_v"
+    fi
+fi
+
+# ── Цвета оформления ────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -70,7 +92,19 @@ check_root() {
 
 # ── Проверка статуса VPN ────────────────────────────────────
 vpn_is_up() {
-    ip link show "$VPN_IFACE" &>/dev/null
+    ip link show dev "$VPN_IFACE" &>/dev/null
+}
+
+vpn_has_carrier() {
+    ip -o link show dev "$VPN_IFACE" 2>/dev/null | grep -q "LOWER_UP"
+}
+
+vpn_has_ip() {
+    ip -4 -o addr show dev "$VPN_IFACE" 2>/dev/null | grep -q "inet "
+}
+
+vpn_get_ip() {
+    ip -4 -o addr show dev "$VPN_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
 }
 
 # ── Определение MTU ─────────────────────────────────────────
@@ -83,6 +117,33 @@ get_vpn_mtu() {
 # ── Проверка: netns существует? ─────────────────────────────
 netns_exists() {
     ip netns list 2>/dev/null | grep -qw "$NETNS"
+}
+
+# ── Policy Routing (Второй рубеж обороны ядра) ──────────────
+policy_up() {
+    step "Настройка Policy Routing (table $RT_TABLE, prio $RT_PRIO)"
+    if ! ip rule show 2>/dev/null | grep -q "^${RT_PRIO}:.*iif ${VETH_HOST}"; then
+        ip rule add iif "$VETH_HOST" priority "$RT_PRIO" lookup "$RT_TABLE"
+        info "Добавлено правило policy routing: iif $VETH_HOST lookup $RT_TABLE (prio $RT_PRIO)"
+    fi
+    # Перманентный fail-closed маршрут с наивысшей метрикой
+    ip route replace unreachable default table "$RT_TABLE" metric 9999
+    info "Установлен fail-closed fallback: unreachable default table $RT_TABLE (metric 9999)"
+}
+
+vpn_route() {
+    if vpn_is_up; then
+        ip route replace default dev "$VPN_IFACE" table "$RT_TABLE" metric 10 2>/dev/null || true
+    else
+        ip route del default dev "$VPN_IFACE" table "$RT_TABLE" metric 10 2>/dev/null || true
+    fi
+}
+
+policy_down() {
+    step "Очистка Policy Routing (table $RT_TABLE)"
+    while ip rule del priority "$RT_PRIO" 2>/dev/null; do :; done
+    ip route flush table "$RT_TABLE" 2>/dev/null || true
+    info "Таблица $RT_TABLE и правила iif $VETH_HOST очищены"
 }
 
 # ── Поднять netns + veth + MTU + маршруты + DNS ────────────
@@ -119,62 +180,63 @@ setup_netns() {
         ip link set "$VETH_NS" netns "$NETNS"
     fi
 
-    # 6. Настроить хостовую сторону
+    # 6. Настроить хостовую сторону veth
     ip addr flush dev "$VETH_HOST" 2>/dev/null || true
     ip addr add "${HOST_IP}/${PREFIX}" dev "$VETH_HOST"
     ip link set "$VETH_HOST" mtu "$vpn_mtu" up
 
-    # rp_filter для loose режима
-    sysctl -w "net.ipv4.conf.${VETH_HOST}.rp_filter=2" >/dev/null 2>&1 || true
-    sysctl -w "net.ipv4.conf.all.rp_filter=2" >/dev/null 2>&1 || true
+    # rp_filter строго на veth_host (не трогая глобальный all.rp_filter)
+    sysctl -w "net.ipv4.conf.${VETH_HOST}.rp_filter=1" >/dev/null 2>&1 || true
+    # Полное отключение IPv6 на хостовом конце veth
+    sysctl -w "net.ipv6.conf.${VETH_HOST}.disable_ipv6=1" >/dev/null 2>&1 || true
 
     # 7. Настроить сторону netns
     ip netns exec "$NETNS" ip link set "$VETH_NS" mtu "$vpn_mtu" up
     ip netns exec "$NETNS" ip addr flush dev "$VETH_NS" 2>/dev/null || true
     ip netns exec "$NETNS" ip addr add "${NS_IP}/${PREFIX}" dev "$VETH_NS"
 
-    # 8. Маршрут по умолчанию (только если VPN активен)
-    if vpn_is_up; then
-        ip netns exec "$NETNS" ip route replace default via "$HOST_IP" dev "$VETH_NS"
-        info "Интерфейсы настроены, маршрут default via $HOST_IP активен (AmneziaVPN подключён)"
-    else
-        ip netns exec "$NETNS" ip route del default 2>/dev/null || true
-        warn "AmneziaVPN ($VPN_IFACE) пока не подключён. Трафик изолирован (Kill Switch)"
-    fi
+    # 8. Статический маршрут по умолчанию внутри netns (решение принимает хост через table 200)
+    ip netns exec "$NETNS" ip route replace default via "$HOST_IP" dev "$VETH_NS"
+    info "Статический default route внутри netns установлен (via $HOST_IP dev $VETH_NS)"
 
-    # 9. DNS внутри netns строго через AmneziaVPN (100.64.0.1)
+    # 9. DNS внутри netns строго через VPN_DNS
     mkdir -p "/etc/netns/${NETNS}"
     cat > "/etc/netns/${NETNS}/resolv.conf" << EOF
-# DNS для netns $NETNS — AmneziaVPN
-nameserver $DNS_AMNEZIA
+# DNS для netns $NETNS
+nameserver $VPN_DNS
 EOF
-    info "DNS настроен: $DNS_AMNEZIA (/etc/netns/${NETNS}/resolv.conf)"
+    info "DNS настроен: $VPN_DNS (/etc/netns/${NETNS}/resolv.conf)"
 
-    # 10. Включить ip_forward на хосте
+    # 10. Сохранить текущее значение и включить ip_forward на хосте
+    local orig_fwd
+    orig_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+    echo "$orig_fwd" > "$ORIG_FWD_FILE"
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-    # 11. Настроить правила nftables
+    # 11. Настроить Policy Routing
+    policy_up
+    vpn_route
+
+    # 12. Настроить правила nftables
     setup_nftables
 }
 
-# ── nftables: NAT, Kill Switch, Input Protection, Dynamic MSS ──
+# ── nftables: Атомарная загрузка правил NAT и Kill Switch ──
 setup_nftables() {
-    step "Настройка правил nftables"
+    step "Настройка правил nftables (атомарная загрузка транзакцией)"
 
-    # Удалить старые таблицы
-    nft delete table ip "$NFT_TABLE" 2>/dev/null || true
-    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
-
-    # Создать специализированную таблицу
+    # Атомарная замена в одной транзакции (исключено окно без файрвола)
     nft -f - << NFT_RULES
+table inet $NFT_TABLE
+delete table inet $NFT_TABLE
 table inet $NFT_TABLE {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
-        # Принудительный перехват любого DNS (порт 53) из клетки на DNS AmneziaVPN (100.64.0.1)
-        iifname "${VETH_HOST}" meta l4proto { tcp, udp } th dport 53 dnat ip to ${DNS_AMNEZIA}:53
+        # Перехват любого DNS (порт 53 UDP/TCP) из клетки на VPN_DNS
+        iifname "${VETH_HOST}" meta l4proto { tcp, udp } th dport 53 dnat ip to ${VPN_DNS}:53
     }
     chain input {
-        type filter hook input priority -1; policy accept;
+        type filter hook input priority -10; policy accept;
         meta nfproto ipv6 iifname "${VETH_HOST}" drop
         iifname "${VETH_HOST}" ct state established,related accept
         iifname "${VETH_HOST}" ip protocol icmp icmp type echo-request ip daddr ${HOST_IP} accept
@@ -182,15 +244,15 @@ table inet $NFT_TABLE {
         iifname "${VETH_HOST}" drop
     }
     chain forward {
-        type filter hook forward priority -1; policy accept;
+        type filter hook forward priority -10; policy drop;
         meta nfproto ipv6 iifname "${VETH_HOST}" drop
         meta nfproto ipv6 oifname "${VETH_HOST}" drop
         ct state invalid drop
 
-        # ЖЕСТКИЙ KILL SWITCH (ОБЯЗАТЕЛЬНО ВЫШЕ ct state established!)
-        iifname "${VETH_HOST}" oifname != "${VPN_IFACE}" drop
+        # ЖЕСТКИЙ KILL SWITCH С ИМЕНОВАННЫМ СЧЕТЧИКОМ (СТРОГО ВЫШЕ ct established accept!)
+        iifname "${VETH_HOST}" oifname != "${VPN_IFACE}" counter drop
 
-        # Динамический MSS по реальному MTU маршрута только для трафика клетки
+        # Динамический MSS по MTU маршрута только для трафика клетки
         iifname "${VETH_HOST}" oifname "${VPN_IFACE}" tcp flags syn tcp option maxseg size set rt mtu
         iifname "${VPN_IFACE}" oifname "${VETH_HOST}" tcp flags syn tcp option maxseg size set rt mtu
 
@@ -199,22 +261,22 @@ table inet $NFT_TABLE {
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        # NAT строго через amn0
+        # NAT строго через VPN_IFACE
         ip saddr ${SUBNET}.0/${PREFIX} oifname "${VPN_IFACE}" masquerade
     }
 }
 NFT_RULES
 
-    # Интеграция со стандартным inet filter forward (если на хосте default policy drop)
+    # Интеграция с существующим inet filter forward (если на хосте default policy drop)
     if nft list chain inet filter forward &>/dev/null; then
         for handle in $(nft -a list chain inet filter forward 2>/dev/null | grep -E 'claude-vpn' | awk '{print $NF}'); do
             nft delete rule inet filter forward handle "$handle" 2>/dev/null || true
         done
-        nft insert rule inet filter forward ct state established,related accept comment "claude-vpn" 2>/dev/null || true
+        nft insert rule inet filter forward iifname "${VPN_IFACE}" oifname "${VETH_HOST}" ct state established,related accept comment "claude-vpn" 2>/dev/null || true
         nft insert rule inet filter forward iifname "${VETH_HOST}" oifname "${VPN_IFACE}" accept comment "claude-vpn" 2>/dev/null || true
     fi
 
-    info "Таблица $NFT_TABLE загружена (Dynamic rt mtu, Hard Kill Switch, Input isolation, DNS dnat)"
+    info "Таблица $NFT_TABLE загружена атомарно (Priority -10, Fail-Closed, Drop counter, rt mtu, DNS dnat)"
 }
 
 # ── Проверка связности ──────────────────────────────────────
@@ -236,30 +298,30 @@ verify_connectivity() {
         all_ok=false
     fi
 
-    # 2. Пинг внешнего IP (8.8.8.8)
-    if ip netns exec "$NETNS" ping -c 2 -W 3 8.8.8.8 &>/dev/null; then
-        info "Пинг 8.8.8.8 (ICMP через VPN): OK"
+    # 2. Пинг внешнего IP (1.1.1.1) через VPN
+    if ip netns exec "$NETNS" ping -c 2 -W 3 1.1.1.1 &>/dev/null; then
+        info "Пинг 1.1.1.1 (ICMP через VPN): OK"
     else
-        warn "Пинг 8.8.8.8: FAIL"
+        warn "Пинг 1.1.1.1: FAIL"
         all_ok=false
     fi
 
-    # 3. Проверка DNS через 100.64.0.1
+    # 3. Проверка DNS через VPN_DNS
     if command -v dig &>/dev/null; then
         local dns_res
-        dns_res=$(ip netns exec "$NETNS" dig +short +time=3 +tries=2 @${DNS_AMNEZIA} google.com 2>/dev/null | head -n1 || echo "")
+        dns_res=$(ip netns exec "$NETNS" dig +short +time=3 +tries=2 @${VPN_DNS} google.com 2>/dev/null | head -n1 || echo "")
         if [[ -n "$dns_res" ]]; then
-            info "DNS резолв (@${DNS_AMNEZIA} google.com -> $dns_res): OK"
+            info "DNS резолв (@${VPN_DNS} google.com -> $dns_res): OK"
         else
-            warn "DNS резолв (@${DNS_AMNEZIA} google.com): FAIL"
+            warn "DNS резолв (@${VPN_DNS} google.com): FAIL"
             all_ok=false
         fi
 
         # Проверка прозрачного перехвата стороннего DNS (dnat)
         local dnat_res
-        dnat_res=$(ip netns exec "$NETNS" dig +short +time=3 +tries=2 @1.1.1.1 google.com 2>/dev/null | head -n1 || echo "")
+        dnat_res=$(ip netns exec "$NETNS" dig +short +time=3 +tries=2 @8.8.8.8 google.com 2>/dev/null | head -n1 || echo "")
         if [[ -n "$dnat_res" ]]; then
-            info "Перехват стороннего DNS (@1.1.1.1 -> DNAT 100.64.0.1): OK ($dnat_res)"
+            info "Перехват стороннего DNS (@8.8.8.8 -> DNAT $VPN_DNS): OK ($dnat_res)"
         else
             warn "Перехват стороннего DNS: FAIL"
             all_ok=false
@@ -279,7 +341,7 @@ verify_connectivity() {
     ext_ip=$(ip netns exec "$NETNS" curl -s -m 5 https://ifconfig.me 2>/dev/null || echo "")
     if [[ -n "$ext_ip" ]]; then
         info "HTTPS связность: OK"
-        info "Внешний IP в netns: $ext_ip (AmneziaVPN)"
+        info "Внешний IP в netns: $ext_ip ($VPN_IFACE)"
     else
         warn "HTTPS связность: FAIL"
         all_ok=false
@@ -292,53 +354,111 @@ verify_connectivity() {
     fi
 }
 
-# ── Watchdog демон ──────────────────────────────────────────
-# Следит за интерфейсом amn0 в фоновом режиме:
-# - Использует flock для исключения параллельных демонов
-# - Слушает события netlink (ip monitor link route) с таймаутом 3с
-# - Синхронизирует MTU на veth_host и veth_ns при изменении на amn0
-# - При падении amn0 удаляет маршрут и принудительно обрывает сокеты (ss -K)
+# ── Watchdog демон реального времени (Netlink Reconcile) ────
+# Состояние демона:
+LAST_HEALTHY=-1
+LAST_VPN_IP=""
+LAST_MTU=0
+LIVENESS_FAILS=0
+
+reconcile_state() {
+    if ! netns_exists; then
+        return 0
+    fi
+
+    # 1. Авто-исцеление таблицы nftables при внешнем flush ruleset
+    if ! nft list table inet "$NFT_TABLE" &>/dev/null; then
+        warn "Таблица $NFT_TABLE отсутствует в ядре (внешний flush?)! Восстанавливаю..."
+        setup_nftables 2>/dev/null || true
+    fi
+
+    # 2. Проверка аппаратного состояния интерфейса туннеля
+    local is_up=false
+    local vpn_ip=""
+    if vpn_is_up && vpn_has_carrier && vpn_has_ip; then
+        is_up=true
+        vpn_ip=$(vpn_get_ip)
+    fi
+
+    # 3. Liveness-проба (если интерфейс активен)
+    local is_healthy=false
+    if [[ "$is_up" = true ]]; then
+        if ping -I "$VPN_IFACE" -c 1 -W 2 1.1.1.1 &>/dev/null || (command -v dig &>/dev/null && dig +short +time=2 +tries=1 @${VPN_DNS} example.com >/dev/null 2>&1); then
+            is_healthy=true
+            LIVENESS_FAILS=0
+        else
+            ((LIVENESS_FAILS++))
+            if [[ $LIVENESS_FAILS -lt 2 ]]; then
+                is_healthy=true # 1 льготный цикл при кратковременном сетевом джиттере
+            else
+                is_healthy=false
+            fi
+        fi
+    else
+        LIVENESS_FAILS=0
+    fi
+
+    # 4. Приведение маршрутизации к фактическому состоянию
+    local current_mtu
+    current_mtu=$(get_vpn_mtu)
+
+    if [[ "$is_healthy" = true ]]; then
+        if [[ "$LAST_HEALTHY" != "1" || "$vpn_ip" != "$LAST_VPN_IP" || "$current_mtu" != "$LAST_MTU" ]]; then
+            ip link set "$VETH_HOST" mtu "$current_mtu" 2>/dev/null || true
+            ip netns exec "$NETNS" ip link set "$VETH_NS" mtu "$current_mtu" 2>/dev/null || true
+            ip route replace default dev "$VPN_IFACE" table "$RT_TABLE" metric 10 2>/dev/null || true
+
+            # При смене IP туннеля очищаем старые conntrack записи и зависшие сокеты
+            if [[ -n "$LAST_VPN_IP" && "$vpn_ip" != "$LAST_VPN_IP" ]]; then
+                ip netns exec "$NETNS" ss -K -tu 'not dst 127.0.0.0/8' 2>/dev/null || true
+                command -v conntrack &>/dev/null && conntrack -D -s "$NS_IP" 2>/dev/null || true
+            fi
+
+            LAST_HEALTHY=1
+            LAST_VPN_IP="$vpn_ip"
+            LAST_MTU="$current_mtu"
+        fi
+    else
+        if [[ "$LAST_HEALTHY" != "0" ]]; then
+            # Снимаем маршрут из table 200 (трафик мгновенно попадает в unreachable metric 9999)
+            ip route del default dev "$VPN_IFACE" table "$RT_TABLE" metric 10 2>/dev/null || true
+            # Немедленный сброс внешних сокетов клетки (loopback 127.0.0.1 сохраняется)
+            ip netns exec "$NETNS" ss -K -tu 'not dst 127.0.0.0/8' 2>/dev/null || true
+            command -v conntrack &>/dev/null && conntrack -D -s "$NS_IP" 2>/dev/null || true
+
+            LAST_HEALTHY=0
+            LAST_VPN_IP=""
+        fi
+    fi
+}
+
 watchdog_loop() {
-    exec 200>"$PID_FILE"
+    # Append mode (>>), исключает усечение файла до захвата блокировки
+    exec 200>>"$PID_FILE"
     if ! flock -n 200; then
         exit 0
     fi
     echo "$$" > "$PID_FILE"
 
-    local last_mtu=0
-    while true; do
-        if netns_exists; then
-            if vpn_is_up; then
-                local current_mtu
-                current_mtu=$(get_vpn_mtu)
+    LAST_HEALTHY=-1
+    LAST_VPN_IP=""
+    LAST_MTU=0
+    LIVENESS_FAILS=0
 
-                local has_default
-                has_default=$(ip netns exec "$NETNS" ip route show default 2>/dev/null | grep -q "default" && echo "1" || echo "0")
-
-                if [[ "$has_default" != "1" || "$current_mtu" != "$last_mtu" ]]; then
-                    ip link set "$VETH_HOST" mtu "$current_mtu" 2>/dev/null || true
-                    ip netns exec "$NETNS" ip link set "$VETH_NS" mtu "$current_mtu" 2>/dev/null || true
-                    ip netns exec "$NETNS" ip route replace default via "$HOST_IP" dev "$VETH_NS" 2>/dev/null || true
-                    setup_nftables 2>/dev/null || true
-                    last_mtu="$current_mtu"
+    while netns_exists; do
+        ip -o monitor link 2>/dev/null | grep --line-buffered -w "$VPN_IFACE" | while :; do
+            reconcile_state </dev/null
+            read -r -t 5 _ || {
+                rc=$?
+                if [[ $rc -le 128 && $rc -ne 0 ]]; then
+                    # Pipe закрыт / EOF
+                    break
                 fi
-            else
-                if ip netns exec "$NETNS" ip route show default 2>/dev/null | grep -q "default"; then
-                    ip netns exec "$NETNS" ip route del default 2>/dev/null || true
-                    # Сброс только внешних сокетов — loopback не трогаем (нужен для MCP/IPC)
-                    ip netns exec "$NETNS" ss -K dst != 127.0.0.0/8 2>/dev/null || true
-                    # Опционально: очистить conntrack на хосте
-                    conntrack -D -s 10.200.1.2 2>/dev/null || true
-                fi
-                last_mtu=0
-            fi
-        fi
-
-        # Безопасное ожидание события Netlink (до 3 сек):
-        #  - FD 200 (flock) закрывается в подпроцессе, чтобы сироты не удерживали блокировку
-        #  - timeout гарантированно убивает ip monitor
-        #  - head -n 1 закрывает пайп после первого события
-        ( exec 200>&-; timeout 3 ip monitor link route 2>/dev/null | head -n 1 >/dev/null ) || true
+            }
+            # Debounce: вычитываем пачку быстрых событий за 200мс
+            while read -r -t 0.2 _; do :; done
+        done
+        sleep 2
     done
 }
 
@@ -376,31 +496,27 @@ cmd_up() {
     vpn_mtu=$(get_vpn_mtu)
 
     if netns_exists; then
-        info "Namespace $NETNS уже существует, обновляю сетевые настройки и правила"
+        info "Namespace $NETNS уже существует, синхронизирую настройки"
         ip link set "$VETH_HOST" mtu "$vpn_mtu" 2>/dev/null || true
         ip netns exec "$NETNS" ip link set "$VETH_NS" mtu "$vpn_mtu" 2>/dev/null || true
+        policy_up
+        vpn_route
         setup_nftables
-        if vpn_is_up; then
-            ip netns exec "$NETNS" ip route replace default via "$HOST_IP" dev "$VETH_NS" 2>/dev/null || true
-        else
-            ip netns exec "$NETNS" ip route del default 2>/dev/null || true
-        fi
     else
         setup_netns
     fi
 
-    # Запустить постоянный watchdog в фоне
     start_watchdog
 
     echo ""
     if vpn_is_up; then
         verify_connectivity
         echo ""
-        info "Сеть netns $NETNS и Kill Switch активны, VPN туннель подключён!"
+        info "Сеть netns $NETNS, Policy Routing и Kill Switch активны, VPN подключён!"
     else
-        warn "AmneziaVPN ($VPN_IFACE) пока не подключён."
-        info "Сеть netns $NETNS и Kill Switch активны (холодный старт: трафик заблокирован)."
-        info "Как только AmneziaVPN подключится, интернет у Claude включится автоматически."
+        warn "VPN ($VPN_IFACE) пока не подключён."
+        info "Сеть netns $NETNS и Kill Switch активны (холодный старт: трафик заблокирован fail-closed)."
+        info "Как только VPN подключится, интернет у Claude включится автоматически."
     fi
 }
 
@@ -411,29 +527,44 @@ cmd_down() {
     # 1. Остановить watchdog
     stop_watchdog
 
-    # 2. Удалить правила из inet filter forward
+    # 2. Очистить policy routing (table 200 и ip rule)
+    policy_down
+
+    # 3. Восстановить исходное значение net.ipv4.ip_forward
+    if [[ -f "$ORIG_FWD_FILE" ]]; then
+        local orig_fwd
+        orig_fwd=$(cat "$ORIG_FWD_FILE" 2>/dev/null || echo 0)
+        if [[ "$orig_fwd" =~ ^[01]$ ]]; then
+            sysctl -w net.ipv4.ip_forward="$orig_fwd" >/dev/null 2>&1 || true
+            info "Восстановлено исходное значение net.ipv4.ip_forward=$orig_fwd"
+        fi
+        rm -f "$ORIG_FWD_FILE" 2>/dev/null || true
+    fi
+
+    # 4. Удалить правила из inet filter forward (если были)
     if nft list chain inet filter forward &>/dev/null; then
         for handle in $(nft -a list chain inet filter forward 2>/dev/null | grep -E 'claude-vpn' | awk '{print $NF}'); do
             nft delete rule inet filter forward handle "$handle" 2>/dev/null || true
         done
     fi
 
-    # 3. Удалить netns
+    # 5. Сбросить внешние сокеты и удалить netns
     if netns_exists; then
+        ip netns exec "$NETNS" ss -K -tu 'not dst 127.0.0.0/8' 2>/dev/null || true
         ip netns del "$NETNS" 2>/dev/null && info "Namespace $NETNS удалён" || warn "Не удалось удалить namespace"
     else
         info "Namespace $NETNS уже отсутствует"
     fi
 
-    # 4. Удалить хостовой veth
+    # 6. Удалить хостовой veth
     ip link del "$VETH_HOST" 2>/dev/null || true
 
-    # 5. Удалить nftables таблицы
+    # 7. Удалить nftables таблицы
     nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     nft delete table ip "$NFT_TABLE" 2>/dev/null || true
     info "nftables правила очищены"
 
-    # 6. Удалить DNS конфиг
+    # 8. Удалить DNS конфиг
     rm -rf "/etc/netns/${NETNS}" 2>/dev/null || true
 
     info "Очистка завершена. Сеть отключена."
@@ -441,29 +572,11 @@ cmd_down() {
 
 # ── Команда 3: claude-vpn <app> ─────────────────────────────
 cmd_run() {
-    local app_cmd=("$@")
+    local -a app_cmd=("$@")
 
     if [[ ${#app_cmd[@]} -eq 0 ]]; then
         err "Не указана команда для запуска"
         echo "Использование: claude-vpn <приложение> [аргументы...]"
-        exit 1
-    fi
-
-    # Поддержка синтаксиса `claude-vpn exec [--] <cmd...>`
-    if [[ "${app_cmd[0]}" == "exec" ]]; then
-        app_cmd=("${app_cmd[@]:1}")
-        if [[ "${app_cmd[0]:-}" == "--" ]]; then
-            app_cmd=("${app_cmd[@]:1}")
-        fi
-        if [[ ${#app_cmd[@]} -eq 0 ]]; then
-            err "Не указана команда для exec"
-            exit 1
-        fi
-    fi
-
-    # Защита от бесконечной рекурсии (fork bomb)
-    if [[ "${CLAUDE_VPN_INTERNAL:-0}" == "1" ]]; then
-        err "Рекурсивный вызов claude-vpn заблокирован внутри netns! Команда: ${app_cmd[*]}"
         exit 1
     fi
 
@@ -483,17 +596,6 @@ cmd_run() {
 
     local base_cmd
     base_cmd=$(basename "${app_cmd[0]}")
-
-    # Безопасный парсинг пользовательских настроек (без source!)
-    local conf_file="${REAL_HOME}/.config/claude-vpn.conf"
-    local claude_tz="Europe/Amsterdam"
-    if [[ -f "$conf_file" ]]; then
-        local parsed_tz
-        parsed_tz=$(grep -E '^CLAUDE_TZ=' "$conf_file" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d '"'\'' ')
-        if [[ "$parsed_tz" =~ ^[A-Za-z0-9_+-]+/[A-Za-z0-9_+-]+$ ]]; then
-            claude_tz="$parsed_tz"
-        fi
-    fi
 
     # Разрешение бинарника Claude CLI и самовосстановление перехватчика при 'claude update'
     local local_bin_claude="${REAL_HOME}/.local/bin/claude"
@@ -525,57 +627,40 @@ EOF
         elif [[ -x "/usr/lib/claude-desktop/claude-desktop" ]]; then
             app_cmd[0]="/usr/lib/claude-desktop/claude-desktop"
         fi
+        local -a electron_flags=(
+            "--disable-features=AsyncDns,DnsOverHttps"
+            "--password-store=basic"
+        )
+        for flag in "${electron_flags[@]}"; do
+            if [[ ! " ${app_cmd[*]} " =~ " ${flag} " ]]; then
+                app_cmd+=("$flag")
+            fi
+        done
     fi
 
     # Уведомление о состоянии VPN
     if ! vpn_is_up; then
-        warn "AmneziaVPN ($VPN_IFACE) сейчас отключён! Приложение запущено без доступа в сеть."
+        warn "VPN ($VPN_IFACE) сейчас отключён! Приложение запущено без доступа в сеть (Fail-Closed)."
         warn "Интернет появится автоматически сразу после подключения VPN."
     fi
 
-    # ── Подготовка флагов Sandbox для Electron / claude-desktop / flatpak ──
-    local is_claude_desktop=false
-    local is_flatpak=false
-
-    if [[ "$base_cmd" == "claude-desktop" || "${app_cmd[*]}" =~ "claude-desktop" ]]; then
-        is_claude_desktop=true
-    elif [[ "$base_cmd" == "flatpak" ]]; then
-        is_flatpak=true
+    # Подготовка безопасного прокси для уведомлений (xdg-dbus-proxy)
+    local notify_proxy_sock="${XDG_RUNTIME}/claude_vpn_notify.sock"
+    local notify_proxy_pid=""
+    if command -v xdg-dbus-proxy &>/dev/null && [[ -S "${XDG_RUNTIME}/bus" ]]; then
+        rm -f "$notify_proxy_sock"
+        xdg-dbus-proxy "${XDG_RUNTIME}/bus" "$notify_proxy_sock" --filter --talk=org.freedesktop.Notifications >/dev/null 2>&1 &
+        notify_proxy_pid=$!
+        chown "${REAL_UID}:${REAL_GID}" "$notify_proxy_sock" 2>/dev/null || true
     fi
 
-    local -a sandbox_flags=(
-        "--no-sandbox"
-        "--disable-gpu-sandbox"
-        "--disable-setuid-sandbox"
-    )
-
-    if [[ "$is_claude_desktop" = true ]]; then
-        info "Применяю параметры Electron/Chromium для работы внутри netns"
-        for flag in "${sandbox_flags[@]}"; do
-            if [[ ! " ${app_cmd[*]} " =~ " ${flag} " ]]; then
-                app_cmd+=("$flag")
-            fi
-        done
-
-        # Защита от утечек WebRTC и DoH в Electron, базовое хранилище сессии
-        local -a electron_leak_flags=(
-            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
-            "--disable-features=AsyncDns,DnsOverHttps"
-            "--password-store=basic"
-        )
-        for flag in "${electron_leak_flags[@]}"; do
-            if [[ ! " ${app_cmd[*]} " =~ " ${flag} " ]]; then
-                app_cmd+=("$flag")
-            fi
-        done
-    elif [[ "$is_flatpak" = true ]]; then
-        info "Настройка Flatpak для работы внутри netns"
-        for flag in "${sandbox_flags[@]}"; do
-            if [[ ! " ${app_cmd[*]} " =~ " ${flag} " ]]; then
-                app_cmd+=("$flag")
-            fi
-        done
-    fi
+    cleanup_proxy() {
+        if [[ -n "$notify_proxy_pid" ]]; then
+            kill "$notify_proxy_pid" 2>/dev/null || true
+        fi
+        rm -f "$notify_proxy_sock" 2>/dev/null || true
+    }
+    trap cleanup_proxy EXIT
 
     # ── Окружение GUI / CLI ─────────────────────────────────
     local x_display="${DISPLAY:-:0}"
@@ -598,10 +683,9 @@ EOF
         "TERM=${TERM:-xterm-256color}"
         "PATH=${REAL_HOME}/bin:${REAL_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
         "LANG=${LANG:-ru_RU.UTF-8}"
-        "TZ=${claude_tz}"
+        "TZ=${CLAUDE_TZ}"
         "DISPLAY=${x_display}"
         "XAUTHORITY=${x_authority}"
-        "DBUS_SESSION_BUS_ADDRESS=${dbus_addr}"
         "XDG_RUNTIME_DIR=${XDG_RUNTIME}"
         "XDG_DATA_HOME=${REAL_HOME}/.local/share"
         "XDG_CONFIG_HOME=${REAL_HOME}/.config"
@@ -609,31 +693,62 @@ EOF
         "XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-x11}"
         "PIPEWIRE_RUNTIME_DIR=${XDG_RUNTIME}"
         "ELECTRON_OZONE_PLATFORM_HINT=auto"
-        "ELECTRON_NO_SANDBOX=1"
-        "ELECTRON_DISABLE_SANDBOX=1"
-        "CHROME_DEVEL_SANDBOX="
+        "SSH_AUTH_SOCK="
     )
 
     if [[ -n "$wayland_display" && -S "$wayland_socket" ]]; then
         env_vars+=("WAYLAND_DISPLAY=${wayland_display}")
     fi
 
-    # Изоляция bwrap: скрытие сокетов резолвера, dbus и подмена xdg-open
+    # Создать синтетический стабильный machine-id для клетки
+    local synth_mid_file="/run/claude_vpn_machine_id"
+    if [[ ! -f "$synth_mid_file" ]]; then
+        echo -n "claude_vpn_jail_${REAL_USER}" | sha256sum | head -c 32 > "$synth_mid_file"
+        echo "" >> "$synth_mid_file"
+        chmod 0644 "$synth_mid_file" 2>/dev/null || true
+    fi
+
+    # Изоляция bwrap: маскировка системных и сессионных сокетов, синтетический отпечаток
     local -a bwrap_cmd=(
         bwrap --dev-bind / /
+        --unshare-uts
+        --hostname claude-jail
         --tmpfs /run/systemd/resolve
         --tmpfs /run/dbus
         --ro-bind "/etc/netns/${NETNS}/resolv.conf" /run/systemd/resolve/stub-resolv.conf
         --ro-bind "/etc/netns/${NETNS}/resolv.conf" /run/systemd/resolve/resolv.conf
+        --ro-bind "$synth_mid_file" /etc/machine-id
     )
+    if [[ ! -L /var/lib/dbus/machine-id && -f /var/lib/dbus/machine-id ]]; then
+        bwrap_cmd+=(--ro-bind "$synth_mid_file" /var/lib/dbus/machine-id)
+    fi
+    if [[ -d "/sys/devices/virtual/dmi/id" ]]; then
+        bwrap_cmd+=(--tmpfs "/sys/devices/virtual/dmi/id")
+    fi
     if [[ ! -L /etc/resolv.conf ]]; then
         bwrap_cmd+=(--ro-bind "/etc/netns/${NETNS}/resolv.conf" /etc/resolv.conf)
     fi
 
-    # Скрыть сокет пользовательского systemd (защита от RCE на хост через systemd --user)
+    # Маскировка хостовой сессионной шины D-Bus (AF_UNIX сокет)
+    if [[ -e "${XDG_RUNTIME}/bus" ]]; then
+        bwrap_cmd+=(--ro-bind /dev/null "${XDG_RUNTIME}/bus")
+    fi
+
+    # Маскировка сокетов systemd пользователя (RCE на хост через systemd --user)
     if [[ -d "${XDG_RUNTIME}/systemd" ]]; then
         bwrap_cmd+=(--tmpfs "${XDG_RUNTIME}/systemd")
     fi
+
+    # Маскировка сокетов GnuPG (ssh-agent, gpg-agent)
+    if [[ -d "${XDG_RUNTIME}/gnupg" ]]; then
+        bwrap_cmd+=(--tmpfs "${XDG_RUNTIME}/gnupg")
+    fi
+
+    # Маскировка сокетов связки ключей GNOME / KWallet
+    if [[ -d "${XDG_RUNTIME}/keyring" ]]; then
+        bwrap_cmd+=(--tmpfs "${XDG_RUNTIME}/keyring")
+    fi
+
     # Скрыть автоактивацию D-Bus портала хоста
     if [[ -f "/usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service" ]]; then
         bwrap_cmd+=(--ro-bind /dev/null /usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service)
@@ -652,7 +767,7 @@ EOF
 
     # Прямой exec через setpriv до bwrap (сброс root привилегий перед входом в mntns)
     exec ip netns exec "$NETNS" \
-        setpriv --reuid="$REAL_UID" --regid="$REAL_GID" --init-groups --inh-caps=-all \
+        setpriv --init-groups --no-new-privs --inh-caps=-all --reuid="$REAL_UID" --regid="$REAL_GID" \
         env "${env_vars[@]}" GTK_USE_PORTAL=0 GDK_DEBUG=no-portals \
         "${bwrap_cmd[@]}" \
         -- \
@@ -662,7 +777,7 @@ EOF
 
 # ── Статус ──────────────────────────────────────────────────
 show_status() {
-    echo -e "${CYAN}=== Статус claude-vpn (Hardened) ===${NC}"
+    echo -e "${CYAN}=== Статус claude-vpn (Hardened Zero-Trust) ===${NC}"
     echo ""
 
     local vpn_mtu
@@ -671,10 +786,10 @@ show_status() {
     # VPN
     if vpn_is_up; then
         local vpn_ip
-        vpn_ip=$(ip -4 addr show "$VPN_IFACE" | grep inet | awk '{print $2}')
-        info "AmneziaVPN ($VPN_IFACE): ПОДКЛЮЧЁН — $vpn_ip (MTU: $vpn_mtu)"
+        vpn_ip=$(vpn_get_ip)
+        info "VPN ($VPN_IFACE): ПОДКЛЮЧЁН — $vpn_ip (MTU: $vpn_mtu)"
     else
-        warn "AmneziaVPN ($VPN_IFACE): ОТКЛЮЧЁН (Kill Switch активен)"
+        warn "VPN ($VPN_IFACE): ОТКЛЮЧЁН (Fail-Closed Kill Switch активен)"
     fi
 
     # Netns
@@ -690,13 +805,6 @@ show_status() {
         echo "    $VETH_NS MTU: ${ns_veth_mtu:-unknown}"
         ip netns exec "$NETNS" ip -4 addr show 2>/dev/null | grep -E "inet " | sed 's/^/    /'
 
-        echo "  Синхронизация MTU:"
-        if [[ "$vpn_mtu" == "$host_veth_mtu" && "$vpn_mtu" == "$ns_veth_mtu" ]]; then
-            info "MTU синхронизирован байт-в-байт ($vpn_mtu)"
-        else
-            warn "MTU расходится: VPN=$vpn_mtu, host=$host_veth_mtu, ns=$ns_veth_mtu"
-        fi
-
         echo "  IPv6 в netns:"
         local ip6_state
         ip6_state=$(ip netns exec "$NETNS" sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
@@ -705,15 +813,13 @@ show_status() {
         else
             echo "    ВКЛЮЧЁН"
         fi
-        echo "  Маршруты:"
+        echo "  Маршруты netns:"
         local routes
         routes=$(ip netns exec "$NETNS" ip route show 2>/dev/null)
         if [[ -n "$routes" ]]; then
             echo "$routes" | sed 's/^/    /'
-        else
-            echo "    [Маршрут по умолчанию отсутствует — изоляция Kill Switch]"
         fi
-        echo "  DNS:"
+        echo "  DNS netns:"
         cat "/etc/netns/${NETNS}/resolv.conf" 2>/dev/null | sed 's/^/    /'
 
         echo ""
@@ -721,6 +827,12 @@ show_status() {
     else
         warn "Namespace $NETNS: НЕ ЗАПУЩЕН"
     fi
+
+    # Policy Routing
+    echo ""
+    info "Policy Routing (table $RT_TABLE, prio $RT_PRIO):"
+    ip rule show 2>/dev/null | grep -E "lookup $RT_TABLE" | sed 's/^/    /' || echo "    [Правило ip rule отсутствует]"
+    ip route show table "$RT_TABLE" 2>/dev/null | sed 's/^/    /' || echo "    [Таблица $RT_TABLE пуста]"
 
     # Watchdog
     echo ""
@@ -734,7 +846,7 @@ show_status() {
     echo ""
     if nft list table inet "$NFT_TABLE" &>/dev/null; then
         info "nftables таблица inet $NFT_TABLE: АКТИВНА"
-        nft list chain inet "$NFT_TABLE" forward 2>/dev/null | sed 's/^/    /'
+        nft list chain inet "$NFT_TABLE" forward 2>/dev/null | grep -E "drop|accept" | sed 's/^/    /'
     else
         warn "nftables таблица inet $NFT_TABLE: НЕ НАЙДЕНА"
     fi
@@ -764,9 +876,9 @@ main() {
             echo "Использование: claude-vpn <команда>"
             echo ""
             echo "Управление сетью:"
-            echo "  --up               Поднять netns, veth, nftables и watchdog в фоне"
+            echo "  --up               Поднять netns, veth, policy routing, nftables и watchdog в фоне"
             echo "  --down             Полностью остановить и удалить netns, правила и watchdog"
-            echo "  --status, -s       Показать текущий статус сети, VPN и watchdog"
+            echo "  --status, -s       Показать текущий статус сети, VPN, routing и watchdog"
             echo "  --help, -h         Показать эту справку"
             echo ""
             echo "Запуск приложений (при необходимости поднимет сеть автоматически):"

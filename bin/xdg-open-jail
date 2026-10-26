@@ -1,6 +1,18 @@
 #!/bin/sh
-# Блокировка открытия ссылок в браузере хоста (вне VPN)
+# ==============================================================================
+# xdg-open-jail — Перехватчик открытия внешних ссылок из сетевой клетки
+# Предотвращает открытие хостового браузера вне VPN-туннеля
+# ==============================================================================
+
+# Копирование ссылки в буфер обмена (X11 + Wayland)
 printf '%s' "$1" | xclip -selection clipboard 2>/dev/null || true
-DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" notify-send -u critical "Claude VPN Jail" "Ссылка скопирована в буфер обмена (открытие в хост-браузере заблокировано): $1" 2>/dev/null || true
-echo "[claude-vpn] URL скопирован в буфер (не открывай без VPN!): $1" >&2
+command -v wl-copy >/dev/null 2>&1 && printf '%s' "$1" | wl-copy 2>/dev/null || true
+
+# Безопасная отправка уведомления: ТОЛЬКО через изолированный сокет-прокси (если активен)
+NOTIFY_PROXY="/run/user/$(id -u)/claude_vpn_notify.sock"
+if [ -S "$NOTIFY_PROXY" ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$NOTIFY_PROXY" notify-send -u critical "Claude VPN Jail" "Ссылка скопирована в буфер обмена (открытие на хосте заблокировано): $1" 2>/dev/null || true
+fi
+
+echo "[claude-vpn] URL скопирован в буфер обмена (открытие на хосте заблокировано): $1" >&2
 exit 0

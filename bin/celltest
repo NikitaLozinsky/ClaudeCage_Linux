@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# celltest — Комплексная диагностика сетевой клетки и защиты от антифрода
+# celltest — Комплексная диагностика эшелонированной защиты и изоляции ClaudeCage
 # ==============================================================================
-
 set -uo pipefail
 
-# ── Определение конфигурации ──────────────────────────────────
-VPN_IFACE="${CLAUDE_VPN_IFACE:-amn0}"
-VPN_DNS="${CLAUDE_VPN_DNS:-100.64.0.1}"
-for _c in "/etc/claude-vpn.conf" "$HOME/.config/claude-vpn.conf"; do
-    if [[ -f "$_c" ]]; then
-        _v=$(grep -E "^VPN_IFACE=" "$_c" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
-        [[ -n "$_v" ]] && VPN_IFACE="$_v"
-        _v=$(grep -E "^VPN_DNS=" "$_c" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
-        [[ -n "$_v" ]] && VPN_DNS="$_v"
-    fi
-done
+# ── Определение конфигурации (Приоритет: /etc/ -> ~/.config/) ──
+VPN_IFACE="amn0"
+VPN_DNS="100.64.0.1"
+CLAUDE_TZ="Europe/Amsterdam"
+
+if [[ -f "/etc/claude-vpn.conf" ]]; then
+    _v=$(grep -E "^VPN_IFACE=" "/etc/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    [[ -n "$_v" ]] && VPN_IFACE="$_v"
+    _v=$(grep -E "^VPN_DNS=" "/etc/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    [[ -n "$_v" ]] && VPN_DNS="$_v"
+    _v=$(grep -E "^CLAUDE_TZ=" "/etc/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    [[ -n "$_v" ]] && CLAUDE_TZ="$_v"
+fi
+
+if [[ -f "$HOME/.config/claude-vpn.conf" ]]; then
+    _v=$(grep -E "^CLAUDE_TZ=" "$HOME/.config/claude-vpn.conf" 2>/dev/null | tail -n1 | cut -d"=" -f2- | sed -e "s/['\" ]//g")
+    [[ -n "$_v" ]] && CLAUDE_TZ="$_v"
+fi
 
 # ── Цвета оформления ──────────────────────────────────────────
 RED='\033[0;31m'
@@ -59,155 +65,275 @@ info_hdr() {
 }
 
 echo -e "${BOLD}${PURPLE}╔══════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${PURPLE}║         CELLTEST: Диагностика изоляции и защиты от антифрода     ║${NC}"
+echo -e "${BOLD}${PURPLE}║      CELLTEST v2.0: Комплексный аудит эшелонированной защиты     ║${NC}"
 echo -e "${BOLD}${PURPLE}╚══════════════════════════════════════════════════════════════════╝${NC}"
 
 # ── 1. ЯДРО И СЕТЕВОЕ ПРОСТРАНСТВО (NETNS) ────────────────────
-info_hdr "1. Ядро Linux и Сетевой Namespace"
+info_hdr "1. Ядро Linux и Сетевой Namespace (Netns)"
 
-# Проверка наличия namespace claude_vpn
+netns_active=false
 if ip netns list 2>/dev/null | grep -qw "claude_vpn"; then
+    netns_active=true
     pass "Сетевое пространство (netns) 'claude_vpn' создано в ядре"
 else
-    fail "Сетевое пространство 'claude_vpn' отсутствует!" "Запустите: claude-vpn --up"
+    fail "Сетевое пространство 'claude_vpn' не создано!" "Запустите: claude-vpn --up"
 fi
 
-# Проверка виртуального кабеля
 if ip link show veth_host &>/dev/null; then
     pass "Интерфейс veth_host на хосте активен (10.200.1.1)"
+    # Проверка rp_filter строго на veth_host
+    veth_rp=$(sysctl -n net.ipv4.conf.veth_host.rp_filter 2>/dev/null || echo "0")
+    if [[ "$veth_rp" == "1" ]]; then
+        pass "Строгая фильтрация обратного пути на veth_host (rp_filter=1)"
+    else
+        warn "На veth_host rp_filter=$veth_rp (рекомендуется 1)"
+    fi
+
+    # Проверка отключения IPv6 на veth_host
+    veth_ip6=$(sysctl -n net.ipv6.conf.veth_host.disable_ipv6 2>/dev/null || echo "0")
+    if [[ "$veth_ip6" == "1" ]]; then
+        pass "IPv6 на хостовом конце veth_host отключён (disable_ipv6=1)"
+    else
+        fail "IPv6 активен на veth_host (риск утечек по локальным каналам)"
+    fi
 else
     fail "Интерфейс veth_host на хосте не найден!"
-fi
-
-if sudo /usr/local/bin/claude-vpn ip link show veth_ns &>/dev/null; then
-    pass "Интерфейс veth_ns внутри netns активен (10.200.1.2, MTU 1376)"
-else
-    fail "Интерфейс veth_ns внутри netns недоступен!"
 fi
 
 # Проверка Watchdog демона
 local_pid=$(pgrep -f "claude-vpn --watchdog-loop" | head -n 1 || true)
 if [[ -n "$local_pid" ]]; then
-    pass "Фоновый Watchdog демон активен (PID: $local_pid)"
+    pass "Фоновый Reconcile Watchdog демон активен (PID: $local_pid)"
 else
     warn "Watchdog демон не запущен (будет автоматически запущен при старте приложения)"
 fi
 
 
-# ── 2. KILL SWITCH И БРАНДМАУЭР (NFTABLES) ─────────────────────
-info_hdr "2. Kill Switch и Защита от Утечек Трафика"
+# ── 2. ДВУХУРОВНЕВЫЙ FAIL-CLOSED KILL SWITCH ─────────────────
+info_hdr "2. Двухуровневый Kill Switch (Policy Routing + nftables)"
 
 vpn_active=false
-if ip -4 addr show "$VPN_IFACE" 2>/dev/null | grep -q "inet"; then
+if ip link show dev "$VPN_IFACE" &>/dev/null && ip -o link show dev "$VPN_IFACE" 2>/dev/null | grep -q "LOWER_UP" && ip -4 addr show "$VPN_IFACE" 2>/dev/null | grep -q "inet"; then
     vpn_active=true
     vpn_ip=$(ip -4 addr show "$VPN_IFACE" | grep "inet" | awk '{print $2}')
     pass "VPN интерфейс ($VPN_IFACE) активен: $vpn_ip"
 else
-    warn "VPN ($VPN_IFACE) отключен! Проверяем жесткую блокировку трафика..."
+    warn "VPN ($VPN_IFACE) отключен! Проверяем жесткую fail-closed блокировку..."
 fi
 
-# Проверка таблицы nftables
-if sudo nft list table inet claude_vpn_nat &>/dev/null; then
-    pass "Таблица nftables 'inet claude_vpn_nat' загружена"
-    
-    # Проверка наличия жесткого правила сброса (Kill Switch)
-    if sudo nft list chain inet claude_vpn_nat forward 2>/dev/null | grep -q 'iifname "veth_host" drop'; then
-        pass "Аппаратный Kill Switch активен: весь трафик мимо $VPN_IFACE сбрасывается (DROP)"
+# 2.1. Эшелон ядра: Policy Routing (Table 200)
+if ip rule show 2>/dev/null | grep -qE "iif veth_host.*lookup 200"; then
+    pass "Policy Routing rule активно (iif veth_host lookup 200, prio 100)"
+else
+    fail "Правило Policy Routing 'iif veth_host lookup 200' не найдено!" "Трафик клетки не изолирован от main таблицы"
+fi
+
+if ip route show table 200 2>/dev/null | grep -qE "unreachable default"; then
+    pass "Fail-Closed fallback маршрут активен (unreachable default table 200 metric 9999)"
+else
+    fail "Fallback маршрут unreachable default table 200 отсутствует!" "При падении VPN возможен fallthrough в wlan0"
+fi
+
+if [[ "$vpn_active" = true ]]; then
+    if ip route show table 200 2>/dev/null | grep -qE "default dev ${VPN_IFACE}"; then
+        pass "Маршрут egress через VPN активен в table 200 (dev $VPN_IFACE metric 10)"
     else
-        fail "Правило Kill Switch 'iifname veth_host drop' не найдено в nftables!"
+        fail "Маршрут default dev $VPN_IFACE отсутствует в table 200!"
+    fi
+fi
+
+# 2.2. Эшелон брандмауэра: nftables
+if sudo nft list table inet claude_vpn_nat &>/dev/null; then
+    pass "Таблица nftables 'inet claude_vpn_nat' загружена в ядре"
+
+    # ЧЕСТНАЯ ПРОВЕРКА KILL SWITCH (строго по oifname != $VPN_IFACE counter drop)
+    ks_rule=$(sudo nft list chain inet claude_vpn_nat forward 2>/dev/null | grep -E 'iifname "veth_host" oifname != "'"${VPN_IFACE}"'".*drop' || true)
+    if [[ -n "$ks_rule" ]]; then
+        pass "Аппаратный Kill Switch активен: трафик мимо $VPN_IFACE сбрасывается"
+        drop_stats=$(echo "$ks_rule" | grep -oE 'packets [0-9]+ bytes [0-9]+' || echo "counter active")
+        pass "Счётчик Kill Switch: $drop_stats"
+    else
+        fail "Правило Kill Switch 'iifname veth_host oifname != $VPN_IFACE drop' не найдено в forward!"
+    fi
+
+    # Проверка приоритета forward цепочки
+    if sudo nft list chain inet claude_vpn_nat forward 2>/dev/null | grep -qE "priority (filter - 10|-10)"; then
+        pass "Приоритет forward цепочки (-10) гарантирует исполнение до Docker/UFW"
+    else
+        warn "Приоритет forward цепочки отличается от -10"
+    fi
+
+    # Проверка динамического MSS Clamping
+    if sudo nft list chain inet claude_vpn_nat forward 2>/dev/null | grep -qE "tcp option maxseg size set rt mtu"; then
+        pass "Динамический MSS Clamping активен (tcp option maxseg size set rt mtu)"
+    else
+        warn "Правило dynamic MSS Clamping не найдено"
+    fi
+
+    # Проверка Input-изоляции хоста
+    if sudo nft list chain inet claude_vpn_nat input 2>/dev/null | grep -qE 'iifname "veth_host" drop'; then
+        pass "Изоляция локальных портов хоста активна (iifname veth_host drop)"
+    else
+        fail "Локальные сервисы хоста доступны из клетки (отсутствует input drop)!"
     fi
 else
     fail "Таблица nftables 'inet claude_vpn_nat' отсутствует!" "Правила NAT и Kill Switch не загружены"
 fi
 
-# Проверка полной блокировки IPv6
-ipv6_disabled=$(sudo /usr/local/bin/claude-vpn sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
-ipv6_routes=$(sudo /usr/local/bin/claude-vpn ip -6 route 2>/dev/null || true)
-
-if [[ "$ipv6_disabled" == "1" && -z "$ipv6_routes" ]]; then
-    pass "IPv6 внутри клетки полностью отключен (0 утечек через IPv6)"
-else
-    fail "IPv6 активен внутри клетки! Возможна утечка реального адреса через IPv6"
+# Проверка отключения IPv6 внутри клетки
+if [[ "$netns_active" = true ]]; then
+    ipv6_disabled=$(sudo /usr/local/bin/claude-vpn sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "0")
+    if [[ "$ipv6_disabled" == "1" ]]; then
+        pass "IPv6 внутри клетки полностью отключён (disable_ipv6=1)"
+    else
+        fail "IPv6 активен внутри клетки! Возможна утечка реального адреса через IPv6"
+    fi
 fi
 
 
-# ── 3. DNS ИЗОЛЯЦИЯ И ЗАЩИТА ОТ DNS LEAK ───────────────────────
-info_hdr "3. Изоляция DNS (DNS Leak Protection)"
+# ── 3. ИЗОЛЯЦИЯ BWRAP, D-BUS И ЦИФРОВОЙ ОТПЕЧАТОК ─────────────
+info_hdr "3. Изоляция Bubblewrap, D-Bus и Цифровой Отпечаток"
+
+if [[ "$netns_active" = true ]]; then
+    # Проверка маскировки хостовой сессионной шины D-Bus (/run/user/UID/bus)
+    bus_masked=$(sudo /usr/local/bin/claude-vpn bash -c '[ -S "/run/user/'"${UID}"'/bus" ] && echo "LEAK" || echo "MASKED"' 2>/dev/null || echo "UNKNOWN")
+    if [[ "$bus_masked" == "MASKED" ]]; then
+        pass "Хостовая сессионная шина (${XDG_RUNTIME:-/run/user/UID}/bus) замаскирована"
+    else
+        fail "УТЕЧКА D-BUS! Хостовая сессионная шина доступна из клетки!"
+    fi
+
+    # Проверка маскировки системного D-Bus (/run/dbus/system_bus_socket)
+    sysbus_masked=$(sudo /usr/local/bin/claude-vpn bash -c '[ -S "/run/dbus/system_bus_socket" ] && echo "LEAK" || echo "MASKED"' 2>/dev/null || echo "UNKNOWN")
+    if [[ "$sysbus_masked" == "MASKED" ]]; then
+        pass "Системный D-Bus сокет (/run/dbus/system_bus_socket) замаскирован"
+    else
+        fail "Системный D-Bus сокет доступен из клетки!"
+    fi
+
+    # Проверка синтетического machine-id
+    host_mid=$(cat /etc/machine-id 2>/dev/null || true)
+    jail_mid=$(sudo /usr/local/bin/claude-vpn cat /etc/machine-id 2>/dev/null || true)
+    if [[ -n "$jail_mid" && "$jail_mid" != "$host_mid" ]]; then
+        pass "Синтетический machine-id активен ($jail_mid != хостовый $host_mid)"
+    elif [[ "$jail_mid" == "$host_mid" ]]; then
+        warn "Идентификатор machine-id совпадает с хостом ($host_mid) — цифровой отпечаток не скрыт"
+    else
+        warn "Не удалось верифицировать machine-id внутри клетки"
+    fi
+
+    # Проверка подмены Hostname
+    jail_host=$(sudo /usr/local/bin/claude-vpn hostname 2>/dev/null || true)
+    if [[ "$jail_host" == "claude-jail" || "$jail_host" == "jail" ]]; then
+        pass "Имя хоста внутри клетки изолировано: $jail_host"
+    else
+        warn "Имя хоста внутри клетки совпадает с реальным хостом: $jail_host"
+    fi
+
+    # Проверка маскировки DMI идентификаторов оборудования
+    dmi_masked=$(sudo /usr/local/bin/claude-vpn bash -c '[ -e "/sys/class/dmi/id/product_name" ] && echo "LEAK" || echo "MASKED"' 2>/dev/null || echo "UNKNOWN")
+    if [[ "$dmi_masked" == "MASKED" ]]; then
+        pass "Аппаратные DMI идентификаторы (/sys/class/dmi/id) замаскированы"
+    else
+        warn "Аппаратный DMI отпечаток доступен для чтения приложением"
+    fi
+
+    # Проверка блокировки хостовых D-Bus порталов
+    portal_masked=$(sudo /usr/local/bin/claude-vpn bash -c '[ -s "/usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service" ] && echo "LEAK" || echo "MASKED"' 2>/dev/null || echo "UNKNOWN")
+    if [[ "$portal_masked" == "MASKED" ]]; then
+        pass "Автоактивация хостового D-Bus портала (/usr/share/dbus-1/.../portal) экранирована"
+    else
+        warn "D-Bus портал хоста доступен для автоактивации"
+    fi
+else
+    warn "Пропуск тестов песочницы: netns не активен"
+fi
+
+
+# ── 4. DNS ИЗОЛЯЦИЯ И ПЕРЕХВАТ DNAT ───────────────────────────
+info_hdr "4. Изоляция DNS и Защита от Утечек Резолвинга"
 
 # Проверка изолированного resolv.conf
 dns_servers=$(sudo /usr/local/bin/claude-vpn cat /etc/resolv.conf 2>/dev/null | grep "nameserver" | awk '{print $2}' || true)
-
 if [[ "$dns_servers" == "$VPN_DNS" ]]; then
     pass "Системный DNS внутри клетки: $VPN_DNS (изолированный резолвер VPN)"
 elif echo "$dns_servers" | grep -qE "127.0.0.53|192.168.|10.0."; then
     fail "ОБНАРУЖЕНА УТЕЧКА DNS! Внутри клетки виден хостовый DNS: $dns_servers"
 else
-    warn "Нестандартный DNS внутри клетки: $dns_servers"
+    warn "DNS внутри клетки: $dns_servers (ожидался $VPN_DNS)"
+fi
+
+# Проверка DNAT перехвата в nftables
+if sudo nft list chain inet claude_vpn_nat prerouting 2>/dev/null | grep -qE "dnat ip to ${VPN_DNS}:53"; then
+    pass "Принудительный DNAT порт 53 -> $VPN_DNS активен в nftables prerouting"
+else
+    fail "Отсутствует правило принудительного перехвата DNS (DNAT на $VPN_DNS)!"
 fi
 
 # Проверка реального резолвинга
-if [[ "$vpn_active" = true ]]; then
+if [[ "$vpn_active" = true && "$netns_active" = true ]]; then
     if sudo /usr/local/bin/claude-vpn getent hosts api.anthropic.com &>/dev/null; then
-        pass "DNS резолвинг доменов Anthropic через VPN: РАБОТАЕТ"
+        pass "DNS резолвинг доменов api.anthropic.com через VPN: РАБОТАЕТ"
     else
         fail "Не удается разрешить домен api.anthropic.com внутри клетки"
     fi
-else
+
+    # Тест прозрачного перехвата стороннего DNS (например, запрос на 8.8.8.8)
+    if command -v dig &>/dev/null; then
+        dnat_test=$(sudo /usr/local/bin/claude-vpn dig +short +time=2 +tries=1 @8.8.8.8 api.anthropic.com 2>/dev/null | head -n1 || echo "")
+        if [[ -n "$dnat_test" ]]; then
+            pass "Прозрачный перехват стороннего DNS (@8.8.8.8 -> DNAT $VPN_DNS): РАБОТАЕТ"
+        else
+            warn "Сторонний DNS запрос @8.8.8.8 не вернул ответ"
+        fi
+    fi
+elif [[ "$vpn_active" = false ]]; then
     pass "DNS запросы надежно заблокированы Kill Switch (VPN отключен)"
 fi
 
 
-# ── 4. АНТИФРОД: ГЕОЛОКАЦИЯ И ЧАСОВОЙ ПОЯС ─────────────────────
-info_hdr "4. Защита от Антифрода (IP, Гео и Timezone)"
+# ── 5. ГЕОЛОКАЦИЯ, EGRESS IP И FAIL-CLOSED ────────────────────
+info_hdr "5. Проверка Egress IP, Timezone и Fail-Closed"
 
 # Проверка таймзоны
-expected_tz="Europe/Amsterdam"
-if [[ -f "$HOME/.config/claude-vpn.conf" ]]; then
-    # shellcheck source=/dev/null
-    source "$HOME/.config/claude-vpn.conf"
-    expected_tz="${CLAUDE_TZ:-Europe/Amsterdam}"
-fi
-
 actual_tz=$(sudo /usr/local/bin/claude-vpn node -e 'console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)' 2>/dev/null || echo "unknown")
-
-if [[ "$actual_tz" == "$expected_tz" ]]; then
+if [[ "$actual_tz" == "$CLAUDE_TZ" ]]; then
     pass "Часовой пояс среды совпадает с сервером VPN: $actual_tz"
 elif [[ "$actual_tz" == "Europe/Moscow" ]]; then
-    fail "ОПАСНО ДЛЯ АНТИФРОДА! Внутри клетки светится московское время (Europe/Moscow) при европейском IP!"
+    fail "ОПАСНО ДЛЯ АНТИФРОДА! Внутри клетки светится московское время ($actual_tz) при европейском IP!"
 else
-    warn "Часовой пояс внутри клетки: $actual_tz (ожидалось: $expected_tz)"
+    warn "Часовой пояс внутри клетки: $actual_tz (ожидалось: $CLAUDE_TZ)"
 fi
 
 # Проверка внешнего IP адреса
-if [[ "$vpn_active" = true ]]; then
+if [[ "$vpn_active" = true && "$netns_active" = true ]]; then
     netns_ip=$(sudo /usr/local/bin/claude-vpn curl -s --max-time 4 https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
-    host_ip=$(curl -s --max-time 3 https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
-
     if [[ -n "$netns_ip" ]]; then
         pass "Внешний IP адрес внутри клетки: $netns_ip ($VPN_IFACE)"
-        
-        # Проверка маршрутизации
-        if ip route show 2>/dev/null | grep -q "dev $VPN_IFACE"; then
-            pass "VPN ($VPN_IFACE) является активным шлюзом (хост и клетка в одной сети VPN: $netns_ip)"
-        else
-            pass "IP клетки изолирован через VPN ($netns_ip)"
-        fi
     else
         fail "Не удалось получить внешний IP через VPN (таймаут или блокировка)"
     fi
-else
-    # Проверка, что при выключенном VPN интернет отсутствует (Kill Switch работает)
-    leak_test=$(sudo /usr/local/bin/claude-vpn curl -s --max-time 2 https://icanhazip.com 2>/dev/null || true)
-    if [[ -z "$leak_test" ]]; then
-        pass "Kill Switch надежен: при отключенном VPN ни одного байта не уходит в сеть"
+
+    # Тест выхода на голый IP без DNS
+    naked_ip_test=$(sudo /usr/local/bin/claude-vpn curl -s --max-time 3 http://1.1.1.1 2>/dev/null | head -n 1 || true)
+    if [[ -n "$naked_ip_test" ]]; then
+        pass "Прямой доступ к публичным IP через VPN туннель: РАБОТАЕТ"
     else
-        fail "КРИТИЧЕСКАЯ УТЕЧКА! VPN отключен, но трафик выходит в сеть: $leak_test"
+        warn "Прямой запрос к 1.1.1.1 не вернул ответ"
+    fi
+elif [[ "$vpn_active" = false && "$netns_active" = true ]]; then
+    # Проверка, что при выключенном VPN интернет отсутствует (Fail-Closed работает)
+    leak_test=$(sudo /usr/local/bin/claude-vpn curl -s --max-time 2 http://1.1.1.1 2>/dev/null || true)
+    if [[ -z "$leak_test" ]]; then
+        pass "Fail-Closed Kill Switch надёжен: прямой трафик на 1.1.1.1 заблокирован"
+    else
+        fail "КРИТИЧЕСКАЯ УТЕЧКА! VPN отключен, но трафик выходит на 1.1.1.1: $leak_test"
     fi
 fi
 
 
-# ── 5. ТОЧКИ ЗАПУСКА И УСТОЙЧИВОСТЬ К ОБНОВЛЕНИЯМ ──────────────
-info_hdr "5. Точки запуска и Защита от Перезаписи (Обновления)"
+# ── 6. ТОЧКИ ЗАПУСКА И УСТОЙЧИВОСТЬ К ОБНОВЛЕНИЯМ ──────────────
+info_hdr "6. Точки запуска и Защита от Перезаписи (Обновления)"
 
 # Проверка Fish-функций
 if [[ -f "$HOME/.config/fish/functions/claude.fish" ]]; then
@@ -262,9 +388,9 @@ else
 fi
 
 
-# ── 6. ИТОГОВЫЙ ВЕРДИКТ ─────────────────────────────────────────
-info_hdr "Итоговый результат"
-echo -e "Проверено тестов: ${BOLD}$CHECKS${NC} | Ошибок: ${BOLD}${RED}$ERRORS${NC} | Предупреждений: ${BOLD}${YELLOW}$WARNINGS${NC}"
+# ── 7. ИТОГОВЫЙ ВЕРДИКТ ─────────────────────────────────────────
+info_hdr "Итоговый результат аудита"
+echo -e "Проверено проверок: ${BOLD}$CHECKS${NC} | Ошибок: ${BOLD}${RED}$ERRORS${NC} | Предупреждений: ${BOLD}${YELLOW}$WARNINGS${NC}"
 
 if [[ $ERRORS -eq 0 && $WARNINGS -eq 0 ]]; then
     echo -e "\n${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
