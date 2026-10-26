@@ -191,16 +191,16 @@ if [[ "$netns_active" = true ]]; then
 
     # 2.3. Доказательство эшелонированной защиты: изолированное тестирование слоёв
     # Слой 1: Policy Routing isolation
-    poly_test=$(sudo /usr/local/bin/claude-vpn --test-policy-layer 2>/dev/null || echo "FAIL")
-    if [[ "$poly_test" == "OK_UNREACHABLE" ]]; then
+    poly_test=$(sudo /usr/local/bin/claude-vpn --test-policy-layer 2>/dev/null | tail -n 1 || echo "FAIL")
+    if [[ "$poly_test" == *"OK_UNREACHABLE"* ]]; then
         pass "Слой 1 (Policy Routing): при отсутствии VPN ядро мгновенно отсекает пакеты (EHOSTUNREACH)"
     else
         fail "Сбой изоляции Слой 1 (Policy Routing): $poly_test"
     fi
 
     # Слой 2: nftables Kill Switch isolation & Drop Counter Delta Assertion
-    nft_test=$(sudo /usr/local/bin/claude-vpn --test-nft-layer 2>/dev/null || echo "FAIL")
-    if [[ "$nft_test" =~ ^OK_DROP_DELTA:([0-9]+)$ ]]; then
+    nft_test=$(sudo /usr/local/bin/claude-vpn --test-nft-layer 2>/dev/null | tail -n 1 || echo "FAIL")
+    if [[ "$nft_test" =~ OK_DROP_DELTA:([0-9]+) ]]; then
         delta="${BASH_REMATCH[1]}"
         pass "Слой 2 (Аппаратный nftables): при обходе Policy Routing пакеты перехватываются Kill Switch (Drop delta: +$delta)"
     else
@@ -215,8 +215,8 @@ if [[ "$netns_active" = true ]]; then
     fi
 
     # Проверка разрушения зависших сокетов ядра (CONFIG_INET_DIAG_DESTROY и ss -K)
-    sock_test=$(sudo /usr/local/bin/claude-vpn --test-sock-destroy 2>/dev/null || echo "FAIL")
-    if [[ "$sock_test" == "OK_DESTROYED"* ]]; then
+    sock_test=$(sudo /usr/local/bin/claude-vpn --test-sock-destroy 2>/dev/null | tail -n 1 || echo "FAIL")
+    if [[ "$sock_test" == *"OK_DESTROYED"* ]]; then
         pass "Гигиена сокетов: CONFIG_INET_DIAG_DESTROY активен, активный TCP сокет успешно уничтожен через ss -K"
     else
         warn "Тест уничтожения сокетов завершился с кодом: $sock_test"

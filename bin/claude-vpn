@@ -981,22 +981,34 @@ cmd_test_nft_layer() {
         return 1
     fi
 
+    # Находим физический адаптер хоста (wlan0/eth0, не VPN и не veth)
+    local phys_dev
+    phys_dev=$(ip route show default 2>/dev/null | grep -v "$VPN_IFACE" | awk '{print $5}' | head -n1)
+    [[ -z "$phys_dev" ]] && phys_dev=$(ip -o link show 2>/dev/null | grep -vE "lo|${VPN_IFACE}|${VETH_HOST}" | awk -F': ' '{print $2}' | head -n1)
+    [[ -z "$phys_dev" ]] && phys_dev="wlan0"
+
+    local test_ip="198.51.100.254"
+
+    # Добавляем тестовый маршрут через физический интерфейс хоста (RFC 5737 TEST-NET-3)
+    ip route replace "${test_ip}/32" dev "$phys_dev" 2>/dev/null || true
+
     local cnt_before
     cnt_before=$(nft list chain inet "$NFT_TABLE" forward 2>/dev/null | grep -E 'oifname !=.*counter' | grep -oE 'packets [0-9]+' | awk '{print $2}' || echo "0")
     [[ -z "$cnt_before" ]] && cnt_before=0
 
-    # Временно снимаем policy routing (трафик направляется в main routing table хоста)
+    # Временно снимаем policy routing (трафик направляется в main routing table хоста к phys_dev)
     ip rule del iif "$VETH_HOST" priority "$RT_PRIO" lookup "$RT_TABLE" 2>/dev/null || true
 
-    # Отправляем 2 пакета на публичный IP
-    ip netns exec "$NETNS" ping -c 2 -W 1 1.1.1.1 >/dev/null 2>&1 || true
+    # Отправляем 2 пакета на тестовый IP наружу
+    ip netns exec "$NETNS" ping -c 2 -W 1 "$test_ip" >/dev/null 2>&1 || true
 
     local cnt_after
     cnt_after=$(nft list chain inet "$NFT_TABLE" forward 2>/dev/null | grep -E 'oifname !=.*counter' | grep -oE 'packets [0-9]+' | awk '{print $2}' || echo "0")
     [[ -z "$cnt_after" ]] && cnt_after=0
 
-    # Восстанавливаем policy routing немедленно
-    policy_up
+    # Восстанавливаем policy routing немедленно без вывода мусора в stdout
+    policy_up >/dev/null 2>&1
+    ip route del "${test_ip}/32" dev "$phys_dev" 2>/dev/null || true
 
     local delta=$((cnt_after - cnt_before))
     if [[ $delta -gt 0 ]]; then
@@ -1015,30 +1027,46 @@ cmd_test_sock_destroy() {
     fi
 
     local test_port=58921
-    # Открываем реальный TCP сокет внутри netns
-    ip netns exec "$NETNS" python3 -c "import socket, time; s = socket.socket(); s.bind(('${NS_IP}', ${test_port})); s.listen(1); time.sleep(5)" >/dev/null 2>&1 &
-    local py_pid=$!
-    sleep 0.1
+    local res
+    res=$(ip netns exec "$NETNS" python3 -c "
+import socket, subprocess, time, sys
 
-    if ! ip netns exec "$NETNS" ss -tlpn 2>/dev/null | grep -q ":${test_port}"; then
-        kill "$py_pid" 2>/dev/null || true
-        echo "FAIL_SOCKET_BIND"
-        return 1
-    fi
+try:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', ${test_port}))
+    srv.listen(1)
 
-    # Сбрасываем сокеты через ss -K
-    ip netns exec "$NETNS" ss -K -t "sport = :${test_port}" >/dev/null 2>&1 || true
-    sleep 0.1
+    cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    cli.connect(('127.0.0.1', ${test_port}))
+    conn, _ = srv.accept()
 
-    local remaining
-    remaining=$(ip netns exec "$NETNS" ss -tlpn 2>/dev/null | grep ":${test_port}" || true)
-    kill "$py_pid" 2>/dev/null || true
+    out1 = subprocess.run(['ss', '-tn', '-H', 'dport = :${test_port}'], capture_output=True, text=True)
+    if not out1.stdout.strip():
+        print('FAIL_NOT_ESTABLISHED')
+        sys.exit(1)
 
-    if [[ -z "$remaining" ]]; then
+    # Уничтожаем через ss -K активное TCP-соединение от root
+    subprocess.run(['ss', '-K', '-t', 'dport = :${test_port}'], capture_output=True)
+    time.sleep(0.05)
+
+    out2 = subprocess.run(['ss', '-tn', '-H', 'dport = :${test_port}'], capture_output=True, text=True)
+    if not out2.stdout.strip():
+        print('OK_DESTROYED')
+        sys.exit(0)
+    else:
+        print('FAIL_STILL_EXISTS')
+        sys.exit(2)
+except Exception as e:
+    print('FAIL_EXCEPTION:' + str(e))
+    sys.exit(3)
+" 2>&1 || echo "FAIL_EXEC")
+
+    if [[ "$res" == *"OK_DESTROYED"* ]]; then
         echo "OK_DESTROYED"
         return 0
     else
-        echo "FAIL_SOCKET_NOT_KILLED"
+        echo "FAIL_SOCKET_NOT_KILLED:$res"
         return 1
     fi
 }
