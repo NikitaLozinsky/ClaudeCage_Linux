@@ -8,11 +8,14 @@
 printf '%s' "$1" | xclip -selection clipboard 2>/dev/null || true
 command -v wl-copy >/dev/null 2>&1 && printf '%s' "$1" | wl-copy 2>/dev/null || true
 
+# Экранирование спецсимволов HTML-разметки (<, >, &) для защиты от кликабельных ссылок в уведомлениях
+escaped_url=$(printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+
 # Безопасная отправка уведомления: ТОЛЬКО через изолированный сокет-прокси (если активен)
 NOTIFY_PROXY="/run/user/$(id -u)/claude_vpn_notify.sock"
 if [ -S "$NOTIFY_PROXY" ]; then
-    DBUS_SESSION_BUS_ADDRESS="unix:path=$NOTIFY_PROXY" notify-send -u critical "Claude VPN Jail" "Ссылка скопирована в буфер обмена (открытие на хосте заблокировано): $1" 2>/dev/null || true
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$NOTIFY_PROXY" notify-send -u critical "Claude VPN Jail" "Ссылка скопирована в буфер обмена (открытие на хосте заблокировано): $escaped_url" 2>/dev/null || true
 fi
 
-echo "[claude-vpn] URL скопирован в буфер обмена (открытие на хосте заблокировано): $1" >&2
+echo "[claude-vpn] URL скопирован в буфер обмена (открытие на хосте заблокировано): $escaped_url" >&2
 exit 0
