@@ -329,16 +329,24 @@ verify_connectivity() {
     fi
 
     # 4. Проверка системного DNS netns
-    if ip netns exec "$NETNS" getent hosts ifconfig.me &>/dev/null; then
+    if ip netns exec "$NETNS" getent hosts google.com &>/dev/null || ip netns exec "$NETNS" getent hosts ifconfig.me &>/dev/null; then
         info "Системный DNS netns (/etc/resolv.conf): OK"
     else
         warn "Системный DNS netns: FAIL"
         all_ok=false
     fi
 
-    # 5. Проверка внешнего IP через curl
-    local ext_ip
-    ext_ip=$(ip netns exec "$NETNS" curl -s -m 5 https://ifconfig.me 2>/dev/null || echo "")
+    # 5. Проверка внешнего IP через curl (с резервными провайдерами на случай таймаута)
+    local ext_ip=""
+    for ep in "https://icanhazip.com" "https://ifconfig.me" "https://api.ipify.org" "https://checkip.amazonaws.com"; do
+        local candidate
+        candidate=$(ip netns exec "$NETNS" curl -s -m 5 "$ep" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ "$candidate" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            ext_ip="$candidate"
+            break
+        fi
+    done
+
     if [[ -n "$ext_ip" ]]; then
         info "HTTPS связность: OK"
         info "Внешний IP в netns: $ext_ip ($VPN_IFACE)"
