@@ -438,6 +438,36 @@ cmd_status() {
     return $ok
 }
 
+cmd_monitor() {
+    load_config || exit 1
+    netns_exists || die "Сетевое пространство $NETNS не запущено. Запустите: claude-vpn --up"
+    
+    echo -e "${C_B}${C_C}=== Мониторинг сетевых соединений ClaudeCage ($NETNS) ===${C_0}"
+    echo -e "Отслеживание активных сокетов и пакетов из клетки (IP $NS_IP)..."
+    echo -e "Нажмите Ctrl+C для выхода.\n"
+    
+    local log_dir="${REAL_HOME:-$HOME}/.local/state/claude-vpn"
+    mkdir -p "$log_dir" 2>/dev/null || true
+    local log_file="${log_dir}/traffic_$(date +%Y-%m-%d).log"
+    
+    if command -v conntrack >/dev/null 2>&1; then
+        echo -e "${C_G}[✓]${C_0} Запущен conntrack kernel монитор. Лог пишется в $log_file"
+        conntrack -E -s "$NS_IP" 2>&1 | while IFS= read -r line; do
+            local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "[$ts] $line" | tee -a "$log_file"
+        done
+    else
+        echo -e "${C_Y}[!]${C_0} conntrack не найден, перехожу в режим socket polling..."
+        while true; do
+            local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+            ip netns exec "$NETNS" ss -tupna 2>/dev/null | grep -v "State.*Recv-Q" | while IFS= read -r sline; do
+                [[ -n "$sline" ]] && echo "[$ts] $sline" | tee -a "$log_file"
+            done
+            sleep 1
+        done
+    fi
+}
+
 cmd_print_config() {
     cat <<EOF
 VPN_IFACE=$VPN_IFACE
@@ -518,8 +548,8 @@ cmd_run() {
     local base=${APP[0]##*/} desktop=0
 
     # 1. ЗАЩИТА ОТ ОБНАРУЖЕНИЯ КЛЕТКИ: запрет запуска из каталога репозитория ClaudeCage
-    # Действует ТОЛЬКО при запуске Claude (CLI или Desktop), чтобы не блокировать служебные команды и celltest
-    if [[ "$base" == "claude"* ]]; then
+    # Действует ТОЛЬКО при запуске Claude (CLI или Desktop), чтобы не блокировать служебные команды, probe и celltest
+    if [[ "$base" == "claude" || "$base" == "claude-desktop" || "$base" == "claude-raw" ]]; then
         local current_pwd="${PWD:-}"
         if [[ -n "$CAGE_REPO_DIR" && "$current_pwd" == "$CAGE_REPO_DIR"* ]] || [[ "$current_pwd" =~ ClaudeCage|claudecage|claude-vpn ]]; then
             err "БЕЗОПАСНОСТЬ: Запуск Claude Code внутри каталога ClaudeCage запрещён!"
@@ -706,7 +736,7 @@ printf "nameserver __VPN_DNS__\n" > /etc/resolv.conf 2>/dev/null || true
 # Полное удаление любых файлов и сервисов клетки из оверлеев ФС
 rm -f /etc/claude-vpn* /etc/sudoers.d/claude-vpn* 2>/dev/null || true
 rm -f /etc/systemd/system/claude-vpn* 2>/dev/null || true
-rm -f /usr/local/bin/claude-vpn* /usr/local/bin/celltest* 2>/dev/null || true
+rm -f /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/claude-probe* 2>/dev/null || true
 rm -rf /usr/local/lib/claude-vpn 2>/dev/null || true
 
 exec "$@"
@@ -740,6 +770,8 @@ main() {
             echo "  --up               Поднять netns, veth, policy routing, nftables и watchdog"
             echo "  --down             Полностью остановить и удалить netns, правила и watchdog"
             echo "  --status, -s       Показать текущий статус сети, VPN, routing и watchdog"
+            echo "  --monitor, -m      Мониторинг сетевых соединений клетки в реальном времени"
+            echo "  --probe            Запуск комплексного аудита сетевой видимости и лазеек"
             echo "  --help, -h         Показать эту справку"
             echo ""
             echo "Запуск приложений (при необходимости поднимет сеть автоматически):"
@@ -758,6 +790,8 @@ main() {
         --up)           load_config || exit 1; cmd_up ;;
         --down|--clean) cmd_down ;;
         --status|-s)    load_config || true; cmd_status ;;
+        --monitor|-m)   load_config || exit 1; cmd_monitor "${@:2}" ;;
+        --probe)        exec /usr/local/bin/claude-probe "${@:2}" ;;
         --print-config) load_config || exit 1; cmd_print_config ;;
         --*)            die "Неизвестный параметр: $1" ;;
         *)              cmd_run "$@" ;;

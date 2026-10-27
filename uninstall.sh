@@ -30,6 +30,7 @@ echo -e "${GREEN}[✓]${NC} Службы systemd остановлены и уд�
 # 3. Удаление системных файлов и sudoers
 sudo rm -f /usr/local/bin/claude-vpn
 sudo rm -f /usr/local/bin/celltest
+sudo rm -f /usr/local/bin/claude-probe
 sudo rm -rf /usr/local/lib/claude-vpn
 sudo rm -f /etc/sudoers.d/claude-vpn
 echo -e "${GREEN}[✓]${NC} Системные бинарники, библиотеки и sudoers удалены."
@@ -49,9 +50,11 @@ fi
 
 rm -f "${USER_BIN}/claude-desktop"
 rm -f "${USER_BIN}/celltest"
+rm -f "${USER_BIN}/claude-probe"
 rm -f "${USER_BIN}/claude-vpn"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude.fish"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude-desktop.fish"
+rm -f "${TARGET_HOME}/.config/fish/functions/claude-probe.fish"
 
 echo -e "${GREEN}${BOLD}ClaudeCage успешно удалён.${NC}"
 echo -e "Примечание: конфигурационный файл /etc/claude-vpn.conf сохранён для бэкапа."

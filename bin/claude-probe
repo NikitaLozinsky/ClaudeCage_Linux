@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+==============================================================================
+CLAUDE-PROBE v1.0 — Network Visibility & Threat Audit Logger for ClaudeCage
+Аудитор и логгер: проверяет, как Claude (CLI и Desktop) видит сеть,
+какие возможности узнать реальный IP и какие лазейки ему доступны.
+==============================================================================
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+VERSION = "1.0-stealth"
+
+# ANSI Цвета оформления
+C_RED = "\033[0;31m"
+C_GREEN = "\033[0;32m"
+C_YELLOW = "\033[1;33m"
+C_BLUE = "\033[0;34m"
+C_PURPLE = "\033[0;35m"
+C_CYAN = "\033[0;36m"
+C_BOLD = "\033[1m"
+C_RESET = "\033[0m"
+
+def strip_ansi(text: str) -> str:
+    """Удаляет ANSI-последовательности для чистого лог-файла."""
+    return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+
+# ==============================================================================
+# Внутриклеточный Payload (выполняется внутри sandbox через claude-vpn)
+# ==============================================================================
+CAGE_PROBE_SCRIPT = r'''
+import os
+import sys
+import json
+import time
+import socket
+import struct
+import ssl
+import subprocess
+import urllib.request
+
+def probe_interfaces():
+    res = {}
+    try:
+        out = subprocess.check_output(["ip", "-j", "addr"], text=True, stderr=subprocess.DEVNULL)
+        data = json.loads(out)
+        for iface in data:
+            name = iface.get("ifname", "")
+            addrs = [a.get("local", "") for a in iface.get("addr_info", [])]
+            mac = iface.get("address", "")
+            res[name] = {"ips": addrs, "mac": mac, "state": iface.get("operstate", "")}
+    except Exception as e:
+        res["error"] = str(e)
+    return res
+
+def probe_sys_class_net():
+    try:
+        return sorted(os.listdir("/sys/class/net"))
+    except Exception as e:
+        return [str(e)]
+
+def probe_node_interfaces():
+    try:
+        code = 'console.log(JSON.stringify(require("os").networkInterfaces()))'
+        out = subprocess.check_output(["node", "-e", code], text=True, stderr=subprocess.DEVNULL)
+        return json.loads(out)
+    except Exception as e:
+        return {"error": str(e)}
+
+def probe_routes():
+    try:
+        out = subprocess.check_output(["ip", "route"], text=True, stderr=subprocess.DEVNULL)
+        return out.strip().splitlines()
+    except Exception as e:
+        return [str(e)]
+
+def probe_arp():
+    try:
+        if os.path.exists("/proc/net/arp"):
+            with open("/proc/net/arp", "r") as f:
+                return f.read().strip().splitlines()
+        return []
+    except Exception as e:
+        return [str(e)]
+
+def probe_stun(host, port=19302):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.5)
+    txn_id = os.urandom(12)
+    cookie = 0x2112A442
+    req = struct.pack(">HHI12s", 0x0001, 0, cookie, txn_id)
+    try:
+        s.sendto(req, (host, port))
+        data, addr = s.recvfrom(2048)
+        if len(data) >= 20:
+            msg_type, msg_len, magic = struct.unpack(">HHI", data[:8])
+            pos = 20
+            while pos < 20 + msg_len:
+                attr_type, attr_len = struct.unpack(">HH", data[pos:pos+4])
+                pos += 4
+                if attr_type == 0x0020: # XOR-MAPPED-ADDRESS
+                    zero, family, xport = struct.unpack(">BBH", data[pos:pos+4])
+                    port_val = xport ^ (cookie >> 16)
+                    if family == 1:
+                        xip = struct.unpack(">I", data[pos+4:pos+8])[0]
+                        ip_val = socket.inet_ntoa(struct.pack(">I", xip ^ cookie))
+                        return {"ip": ip_val, "port": port_val, "server": host, "status": "ok"}
+                pos += attr_len
+    except Exception as e:
+        return {"error": str(e), "server": host, "status": "failed"}
+    finally:
+        s.close()
+    return {"error": "no xor-mapped attribute", "server": host, "status": "failed"}
+
+def probe_egress():
+    results = {}
+    endpoints = {
+        "cloudflare": "https://cloudflare.com/cdn-cgi/trace",
+        "icanhazip": "https://icanhazip.com",
+        "ipify": "https://api.ipify.org?format=json",
+        "ifconfig": "https://ifconfig.me/all.json"
+    }
+    ctx = ssl.create_default_context()
+    for name, url in endpoints.items():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.23.0"})
+            with urllib.request.urlopen(req, timeout=3.5, context=ctx) as resp:
+                raw = resp.read().decode("utf-8", errors="replace").strip()
+                if name == "cloudflare":
+                    d = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+                    results["cloudflare"] = {
+                        "ip": d.get("ip"), "country": d.get("loc"), "colo": d.get("colo")
+                    }
+                elif name in ("ipify", "ifconfig"):
+                    try:
+                        results[name] = json.loads(raw)
+                    except Exception:
+                        results[name] = {"raw": raw}
+                else:
+                    results[name] = {"ip": raw}
+        except Exception as e:
+            results[name] = {"error": str(e)}
+    return results
+
+def probe_host_scan():
+    ports = [22, 53, 80, 443, 3000, 8080, 5432, 6379, 2375, 11434]
+    results = {}
+    for p in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            s.connect(("10.200.1.1", p))
+            results[str(p)] = "OPEN"
+        except socket.timeout:
+            results[str(p)] = "DROPPED (Timeout)"
+        except ConnectionRefusedError:
+            results[str(p)] = "REFUSED (RST)"
+        except Exception as e:
+            results[str(p)] = f"ERR: {type(e).__name__}"
+        finally:
+            s.close()
+    return results
+
+def probe_dns():
+    res = {}
+    try:
+        if os.path.exists("/etc/resolv.conf"):
+            with open("/etc/resolv.conf") as f:
+                res["resolv_conf"] = f.read().strip().splitlines()
+    except Exception as e:
+        res["resolv_conf"] = [str(e)]
+
+    # Тест прямого запроса DNS на 8.8.8.8 (проверка DNAT)
+    try:
+        out = subprocess.check_output(
+            ["dig", "+time=2", "+tries=1", "@8.8.8.8", "whoami.akamai.net", "TXT", "+short"],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        res["direct_8888_akamai"] = out if out else "empty"
+    except Exception as e:
+        res["direct_8888_akamai"] = f"error: {e}"
+    return res
+
+def probe_dbus():
+    res = {
+        "system_bus_exists": os.path.exists("/run/dbus/system_bus_socket"),
+        "user_bus_exists": os.path.exists(f"/run/user/{os.getuid()}/bus"),
+        "user_bus_is_null": False,
+        "networkmanager_reachable": False
+    }
+    if res["user_bus_exists"]:
+        try:
+            st = os.stat(f"/run/user/{os.getuid()}/bus")
+            res["user_bus_is_null"] = (st.st_rdev != 0)
+        except Exception:
+            pass
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(f"/run/user/{os.getuid()}/bus")
+        res["user_bus_connectable"] = True
+        s.close()
+    except Exception:
+        res["user_bus_connectable"] = False
+
+    return res
+
+def probe_stealth():
+    lt = "missing"
+    if os.path.islink("/etc/localtime"):
+        lt = os.readlink("/etc/localtime")
+    elif os.path.exists("/etc/localtime"):
+        lt = "regular_file"
+
+    node_tz = "unknown"
+    try:
+        code = 'console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)'
+        node_tz = subprocess.check_output(["node", "-e", code], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        pass
+
+    loc_conf = "missing"
+    if os.path.exists("/etc/locale.conf"):
+        with open("/etc/locale.conf") as f:
+            loc_conf = f.read().strip().replace("\n", "; ")
+
+    home = os.environ.get("HOME", "")
+    cage_dir = os.path.join(home, "ClaudeCage_Linux")
+    cage_files_count = -1
+    if os.path.isdir(cage_dir):
+        cage_files_count = len(os.listdir(cage_dir))
+
+    return {
+        "localtime_symlink": lt,
+        "node_timezone": node_tz,
+        "locale_conf": loc_conf,
+        "env_lang": os.environ.get("LANG", ""),
+        "env_tz": os.environ.get("TZ", ""),
+        "hostname": socket.gethostname(),
+        "cage_repo_dir_exists": os.path.exists(cage_dir),
+        "cage_repo_files_count": cage_files_count,
+        "bin_claude_vpn_visible": os.path.exists("/usr/local/bin/claude-vpn"),
+        "bin_celltest_visible": os.path.exists("/usr/local/bin/celltest"),
+        "bin_claude_probe_visible": os.path.exists("/usr/local/bin/claude-probe"),
+        "conf_claude_vpn_visible": os.path.exists("/etc/claude-vpn.conf"),
+        "systemd_unit_visible": os.path.exists("/etc/systemd/system/claude-vpn.service")
+    }
+
+data = {
+    "interfaces": probe_interfaces(),
+    "sys_class_net": probe_sys_class_net(),
+    "node_interfaces": probe_node_interfaces(),
+    "routes": probe_routes(),
+    "arp": probe_arp(),
+    "egress": probe_egress(),
+    "stun_google": probe_stun("stun.l.google.com", 19302),
+    "stun_cloudflare": probe_stun("stun.cloudflare.com", 3478),
+    "host_scan": probe_host_scan(),
+    "dns": probe_dns(),
+    "dbus": probe_dbus(),
+    "stealth": probe_stealth()
+}
+
+print(json.dumps(data))
+'''
+
+# ==============================================================================
+# Класс аудитора ClaudeProbe
+# ==============================================================================
+class ClaudeProbe:
+    def __init__(self, target_profile: str = "both", verbose: bool = False, no_color: bool = False, custom_log_dir: Optional[str] = None):
+        self.profile = target_profile
+        self.verbose = verbose
+        self.use_color = (not no_color) and sys.stdout.isatty()
+        self.host_baseline: Dict[str, Any] = {}
+        self.cage_results: Dict[str, Any] = {}
+        self.verdicts: List[Dict[str, str]] = []
+        self.score = 100
+        self.vulnerabilities = 0
+        self.warnings = 0
+
+        # Определение домашнего каталога реального пользователя
+        user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "user"
+        try:
+            import pwd
+            home = pwd.getpwnam(user).pw_dir
+        except Exception:
+            home = os.environ.get("HOME", f"/home/{user}")
+
+        state_base = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+        self.log_dir = custom_log_dir or os.path.join(state_base, "claude-vpn")
+        os.makedirs(self.log_dir, exist_ok=True)
+
+    def color(self, code: str, text: str) -> str:
+        if not self.use_color:
+            return text
+        return f"{code}{text}{C_RESET}"
+
+    # ── 1. Сбор базовой телеметрии хоста (вне клетки) ─────────────────────
+    def collect_host_baseline(self) -> None:
+        """Собирает реальные данные хоста для сравнения с тем, что видит Claude."""
+        baseline: Dict[str, Any] = {}
+        # Интерфейсы хоста
+        try:
+            out = subprocess.check_output(["ip", "-j", "addr"], text=True, stderr=subprocess.DEVNULL)
+            baseline["interfaces"] = json.loads(out)
+        except Exception:
+            baseline["interfaces"] = []
+
+        # Физические MAC и IP адреса хоста
+        real_macs = set()
+        real_ips = set()
+        for iface in baseline.get("interfaces", []):
+            name = iface.get("ifname", "")
+            mac = iface.get("address", "")
+            if mac and mac != "00:00:00:00:00:00" and not name.startswith("veth"):
+                real_macs.add(mac)
+            for addr in iface.get("addr_info", []):
+                ip = addr.get("local", "")
+                if ip and not ip.startswith("127.") and not ip.startswith("10.200.1."):
+                    real_ips.add(ip)
+
+        baseline["real_macs"] = list(real_macs)
+        baseline["real_ips"] = list(real_ips)
+
+        # Таймзона хоста
+        tz = "unknown"
+        if os.path.islink("/etc/localtime"):
+            try:
+                tz = os.readlink("/etc/localtime")
+            except Exception:
+                pass
+        baseline["real_localtime"] = tz
+
+        # Локаль хоста
+        loc = "unknown"
+        if os.path.exists("/etc/locale.conf"):
+            try:
+                with open("/etc/locale.conf") as f:
+                    loc = f.read().strip()
+            except Exception:
+                pass
+        baseline["real_locale"] = loc
+        baseline["hostname"] = socket.gethostname()
+
+        self.host_baseline = baseline
+
+    # ── 2. Выполнение внутриклеточного сканирования ───────────────────────
+    def run_cage_probe(self) -> bool:
+        """Запускает скрипт тестирования внутри клетки через claude-vpn."""
+        cmd = ["sudo", "/usr/local/bin/claude-vpn", "python3", "-c", CAGE_PROBE_SCRIPT]
+        try:
+            # Запускаем в нейтральном каталоге /tmp, чтобы не вызвать сработку защиты директории
+            proc = subprocess.run(
+                cmd,
+                cwd="/tmp",
+                text=True,
+                capture_output=True,
+                timeout=25
+            )
+            if proc.returncode != 0:
+                print(self.color(C_RED, f"[!] Ошибка запуска внутри клетки (код {proc.returncode}):"))
+                print(proc.stderr)
+                return False
+
+            raw_out = proc.stdout.strip()
+            # Находим JSON в выводе
+            start_idx = raw_out.find("{")
+            end_idx = raw_out.rfind("}")
+            if start_idx != -1 and end_idx != -1:
+                json_str = raw_out[start_idx:end_idx+1]
+                self.cage_results = json.loads(json_str)
+                return True
+            else:
+                print(self.color(C_RED, "[!] Не удалось распарсить JSON ответ из клетки."))
+                if self.verbose:
+                    print("RAW:", raw_out)
+                return False
+        except subprocess.TimeoutExpired:
+            print(self.color(C_RED, "[!] Таймаут выполнения зонда внутри клетки!"))
+            return False
+        except Exception as e:
+            print(self.color(C_RED, f"[!] Исключение при выполнении зонда: {e}"))
+            return False
+
+    # ── 3. Анализ векторов атак и поиск лазеек ────────────────────────────
+    def analyze_attack_vectors(self) -> None:
+        """Сравнивает данные хоста и клетки, выявляя лазейки для деанонимизации."""
+        cr = self.cage_results
+        hb = self.host_baseline
+        v: List[Dict[str, str]] = []
+
+        # ── Вектор 1: Egress HTTP/HTTPS IP и Геолокация
+        cf = cr.get("egress", {}).get("cloudflare", {})
+        cf_ip = cf.get("ip", "Не определен")
+        cf_loc = cf.get("country", "??")
+        cf_colo = cf.get("colo", "??")
+
+        egress_status = "SAFE"
+        egress_desc = f"Внешний IP: {cf_ip} ({cf_loc}, {cf_colo})"
+        if cf_loc in ("RU", "RUS") or "russia" in cf_loc.lower():
+            egress_status = "LEAK"
+            egress_desc += " [КРИТИЧЕСКАЯ УТЕЧКА: IP принадлежит РФ!]"
+            self.score -= 50
+            self.vulnerabilities += 1
+        elif cf_ip in hb.get("real_ips", []):
+            egress_status = "LEAK"
+            egress_desc += " [КРИТИЧЕСКАЯ УТЕЧКА: Совпадает с реальным IP хоста!]"
+            self.score -= 50
+            self.vulnerabilities += 1
+
+        v.append({
+            "vector": "1. Внешний IP (Egress HTTP/S)",
+            "status": egress_status,
+            "perception": egress_desc,
+            "threat": "Деанонимизация реального местоположения через запросы к API и сайтам"
+        })
+
+        # ── Вектор 2: WebRTC STUN UDP-рефлексия (обход прокси)
+        stun_g = cr.get("stun_google", {})
+        stun_cf = cr.get("stun_cloudflare", {})
+        stun_ip = stun_g.get("ip") or stun_cf.get("ip") or "Ошибка запроса"
+        stun_port = stun_g.get("port") or stun_cf.get("port") or 0
+
+        stun_status = "SAFE"
+        stun_desc = f"STUN Public Reflexive IP: {stun_ip}:{stun_port}"
+        if stun_ip in hb.get("real_ips", []):
+            stun_status = "LEAK"
+            stun_desc += " [КРИТИЧЕСКАЯ УТЕЧКА: WebRTC узнал реальный IP хоста!]"
+            self.score -= 50
+            self.vulnerabilities += 1
+        elif stun_ip != cf_ip and stun_ip != "Ошибка запроса":
+            stun_status = "WARN"
+            stun_desc += f" [Внимание: IP STUN ({stun_ip}) отличается от HTTP IP ({cf_ip})]"
+            self.score -= 10
+            self.warnings += 1
+
+        v.append({
+            "vector": "2. WebRTC STUN UDP-рефлексия",
+            "status": stun_status,
+            "perception": stun_desc,
+            "threat": "Electron WebRTC может отправить UDP STUN-пакет в обход прокси"
+        })
+
+        # ── Вектор 3: Физические сетевые интерфейсы и MAC-адреса хоста
+        cage_ifaces = list(cr.get("interfaces", {}).keys())
+        cage_sys_net = cr.get("sys_class_net", [])
+        cage_node_ifaces = list(cr.get("node_interfaces", {}).keys())
+
+        iface_status = "SAFE"
+        exposed_phys = []
+        for ifc in cage_ifaces + cage_sys_net + cage_node_ifaces:
+            if re.match(r'^(wlan|eth|enp|wlp|wls|ens|ppp|tun|wg|docker|br-)', ifc):
+                exposed_phys.append(ifc)
+
+        exposed_macs = []
+        for ifc_data in cr.get("interfaces", {}).values():
+            mac = ifc_data.get("mac", "")
+            if mac in hb.get("real_macs", []):
+                exposed_macs.append(mac)
+
+        if exposed_phys or exposed_macs:
+            iface_status = "LEAK"
+            iface_desc = f"Утечка физических адаптеров хоста: {set(exposed_phys)}, MAC: {set(exposed_macs)}"
+            self.score -= 40
+            self.vulnerabilities += 1
+        else:
+            iface_desc = f"Только виртуальные: {', '.join(set(cage_ifaces))} (MAC железа скрыты)"
+
+        v.append({
+            "vector": "3. Физические интерфейсы и MAC",
+            "status": iface_status,
+            "perception": iface_desc,
+            "threat": "Чтение MAC-адресов Wi-Fi/Ethernet для триангуляции и идентификации железа"
+        })
+
+        # ── Вектор 4: Попытка доступа к хосту и портам LAN (Lateral Movement)
+        host_scan = cr.get("host_scan", {})
+        open_ports = [p for p, res in host_scan.items() if res == "OPEN"]
+        # Порт 53 перенаправлен через DNAT на VPN DNS — это легитимно
+        suspicious_open = [p for p in open_ports if p != "53"]
+
+        scan_status = "SAFE"
+        if suspicious_open:
+            scan_status = "LEAK"
+            scan_desc = f"УЯЗВИМОСТЬ: Открыты порты хоста для Claude: {', '.join(suspicious_open)}"
+            self.score -= 30
+            self.vulnerabilities += 1
+        else:
+            scan_desc = "Все порты хоста (SSH, Web, Dev, DB) заблокированы (Timeout / nft drop)"
+
+        v.append({
+            "vector": "4. Сканирование хоста (LAN/SSH)",
+            "status": scan_status,
+            "perception": scan_desc,
+            "threat": "Атака на локальные сервисы пользователя (SSH, Docker, локальные веб-серверы)"
+        })
+
+        # ── Вектор 5: DNS утечки и DNAT перехват
+        dns_data = cr.get("dns", {})
+        resolv = "; ".join(dns_data.get("resolv_conf", []))
+        direct_dns = dns_data.get("direct_8888_akamai", "")
+
+        dns_status = "SAFE"
+        dns_desc = f"/etc/resolv.conf: {resolv}"
+        if "127.0.0.53" in resolv or "192.168." in resolv:
+            dns_status = "WARN"
+            dns_desc += " [Внимание: DNS указывает на локальный резолвер хоста]"
+            self.score -= 15
+            self.warnings += 1
+
+        v.append({
+            "vector": "5. DNS утечки и DNAT перехват",
+            "status": dns_status,
+            "perception": dns_desc,
+            "threat": "Утечка DNS-запросов через хостового провайдера или systemd-resolved"
+        })
+
+        # ── Вектор 6: D-Bus и IPC шины (NetworkManager, Secret Service)
+        dbus_data = cr.get("dbus", {})
+        dbus_status = "SAFE"
+        dbus_desc = "Системный D-Bus отключен; пользовательский bus изолирован (/dev/null)"
+        if dbus_data.get("system_bus_exists"):
+            dbus_status = "WARN"
+            dbus_desc = "Системный сокет /run/dbus/system_bus_socket доступен"
+            self.score -= 15
+            self.warnings += 1
+        if dbus_data.get("user_bus_connectable"):
+            dbus_status = "LEAK"
+            dbus_desc = "КРИТИЧЕСКАЯ УТЕЧКА: Доступна пользовательская шина D-Bus хоста!"
+            self.score -= 30
+            self.vulnerabilities += 1
+
+        v.append({
+            "vector": "6. D-Bus и IPC перехват",
+            "status": dbus_status,
+            "perception": dbus_desc,
+            "threat": "Опрос NetworkManager через D-Bus (утечка списка Wi-Fi сетей и BSSID)"
+        })
+
+        # ── Вектор 7: Антифрод, Таймзона и Локаль (Деанонимизация по РФ)
+        st = cr.get("stealth", {})
+        lt = st.get("localtime_symlink", "")
+        ntz = st.get("node_timezone", "")
+        loc_conf = st.get("locale_conf", "")
+        env_lang = st.get("env_lang", "")
+
+        fraud_status = "SAFE"
+        fraud_desc = f"Таймзона: {ntz} ({lt}), Локаль: {loc_conf}"
+        if "moscow" in lt.lower() or "moscow" in ntz.lower() or "samara" in lt.lower():
+            fraud_status = "LEAK"
+            fraud_desc += " [КРИТИЧЕСКАЯ УТЕЧКА: Таймзона указывает на РФ!]"
+            self.score -= 40
+            self.vulnerabilities += 1
+        elif "ru_ru" in loc_conf.lower() or "ru_ru" in env_lang.lower():
+            fraud_status = "LEAK"
+            fraud_desc += " [КРИТИЧЕСКАЯ УТЕЧКА: Локаль указывает на ru_RU!]"
+            self.score -= 40
+            self.vulnerabilities += 1
+
+        v.append({
+            "vector": "7. Геолокация, Таймзона и Локаль",
+            "status": fraud_status,
+            "perception": fraud_desc,
+            "threat": "Определение нахождения в РФ через Intl API, /etc/localtime и locale.conf"
+        })
+
+        # ── Вектор 8: Сокрытие файлов клетки от ИИ-агента
+        cage_exists = st.get("cage_repo_dir_exists", False)
+        cage_files = st.get("cage_repo_files_count", -1)
+        vpn_bin = st.get("bin_claude_vpn_visible", False)
+        celltest_bin = st.get("bin_celltest_visible", False)
+        systemd_vis = st.get("systemd_unit_visible", False)
+
+        stealth_status = "SAFE"
+        stealth_desc = f"Каталог ClaudeCage: пустой tmpfs ({cage_files} файлов); Бинарники клетки удалены из оверлея"
+        if cage_files > 0:
+            stealth_status = "LEAK"
+            stealth_desc = f"УТЕЧКА: ИИ-агент может прочитать {cage_files} файлов репозитория ClaudeCage!"
+            self.score -= 30
+            self.vulnerabilities += 1
+        elif vpn_bin or celltest_bin or systemd_vis:
+            stealth_status = "WARN"
+            stealth_desc = f"Внимание: Часть служебных бинарников видна в оверлее ФС (vpn={vpn_bin})"
+            self.score -= 10
+            self.warnings += 1
+
+        v.append({
+            "vector": "8. Сокрытие факта клетки от Claude",
+            "status": stealth_status,
+            "perception": stealth_desc,
+            "threat": "Обнаружение агентом скриптов клетки и понимание, что его изолируют"
+        })
+
+        self.verdicts = v
+        self.score = max(0, self.score)
+
+    # ── 4. Форматированный вывод отчета в терминал ─────────────────────────
+    def print_report(self) -> str:
+        """Печатает цветной сводный отчет и возвращает форматированный текст."""
+        lines: List[str] = []
+
+        def out(line: str = ""):
+            lines.append(line)
+            print(line)
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        out(self.color(C_PURPLE + C_BOLD, "╔══════════════════════════════════════════════════════════════════╗"))
+        out(self.color(C_PURPLE + C_BOLD, f"║    CLAUDE-PROBE v{VERSION}: Network Visibility & Leak Audit Logger     ║"))
+        out(self.color(C_PURPLE + C_BOLD, "║         Телеметрия сети и аудит лазеек глазами Claude            ║"))
+        out(self.color(C_PURPLE + C_BOLD, "╚══════════════════════════════════════════════════════════════════╝"))
+        out(f"Время аудита: {now_str} | Профиль: {self.profile.upper()} | Пользователь: {os.environ.get('USER')}\n")
+
+        # ── Сводная таблица по 8 векторам атак
+        out(self.color(C_CYAN + C_BOLD, "━━━ 1. Сводная матрица векторов атак и доступных лазеек ━━━"))
+        header = f"{'Вектор атак / Лазейка':<34} | {'Статус':<14} | {'Восприятие Claude'}"
+        out(header)
+        out("─" * 34 + "-+-" + "─" * 14 + "-+-" + "─" * 40)
+
+        for row in self.verdicts:
+            status = row["status"]
+            if status == "SAFE":
+                status_str = self.color(C_GREEN + C_BOLD, "[БЕЗОПАСНО]   ")
+            elif status == "WARN":
+                status_str = self.color(C_YELLOW + C_BOLD, "[ВНИМАНИЕ]    ")
+            else:
+                status_str = self.color(C_RED + C_BOLD, "[УТЕЧКА!]     ")
+
+            name = row["vector"]
+            perception = row["perception"]
+            if len(perception) > 75 and not self.verbose:
+                perception = perception[:72] + "..."
+            out(f"{name:<34} | {status_str} | {perception}")
+
+        out("")
+
+        # ── Детальный анализ хост vs клетка
+        out(self.color(C_CYAN + C_BOLD, "━━━ 2. Сравнение окружения: Реальный Хост vs Клетка Claude ━━━"))
+        cr = self.cage_results
+        hb = self.host_baseline
+        st = cr.get("stealth", {})
+
+        out(f"  • Видимый IP хоста:    {', '.join(hb.get('real_ips', ['Скрыт']))}")
+        out(f"  • Видимый IP в клетке: {cr.get('egress', {}).get('cloudflare', {}).get('ip', 'N/A')} " +
+            f"(Страна: {cr.get('egress', {}).get('cloudflare', {}).get('country', '??')}, Colo: {cr.get('egress', {}).get('cloudflare', {}).get('colo', '??')})")
+        out(f"  • STUN WebRTC IP:      {cr.get('stun_google', {}).get('ip', 'N/A')}")
+        out(f"  • Интерфейсы хоста:    {len(hb.get('interfaces', []))} шт. (wlan0, eth0 и др.)")
+        out(f"  • Интерфейсы в клетке: {', '.join(list(cr.get('interfaces', {}).keys()))} (только виртуальные veth_ns, lo)")
+        out(f"  • Таймзона хоста:      {hb.get('real_localtime')}")
+        out(f"  • Таймзона в клетке:   {st.get('node_timezone')} (симлинк: {st.get('localtime_symlink')})")
+        out(f"  • Доступ к хосту (SSH):{cr.get('host_scan', {}).get('22', 'UNKNOWN')}")
+        out(f"  • Файлы ClaudeCage:    {st.get('cage_repo_files_count', -1)} файлов (смонтирован пустой tmpfs)")
+        out("")
+
+        # ── Итоговый вердикт
+        out(self.color(C_CYAN + C_BOLD, "━━━ 3. Итоговая оценка защищенности и скрытности ━━━"))
+        if self.score >= 95:
+            score_color = C_GREEN + C_BOLD
+            verdict_text = "ПОЛНАЯ ИЗОЛЯЦИЯ: 100% STEALTH (Лазейки закрыты, утечек нет)"
+        elif self.score >= 70:
+            score_color = C_YELLOW + C_BOLD
+            verdict_text = "ЧАСТИЧНАЯ ИЗОЛЯЦИЯ: Требуется устранить предупреждения"
+        else:
+            score_color = C_RED + C_BOLD
+            verdict_text = "КРИТИЧЕСКАЯ УЯЗВИМОСТЬ: Обнаружена утечка реальных данных пользователя!"
+
+        out(f"  Индекс безопасности: {self.color(score_color, f'{self.score}/100')} | Утечек: {self.vulnerabilities} | Предупреждений: {self.warnings}")
+        out(f"  Вердикт: {self.color(score_color, verdict_text)}\n")
+
+        return "\n".join(lines)
+
+    # ── 5. Сохранение логов на диск ───────────────────────────────────────
+    def save_logs(self, text_report: str) -> Tuple[str, str]:
+        """Сохраняет форматированный текстовый лог и JSON-отчет."""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        txt_path = os.path.join(self.log_dir, f"audit_{timestamp}.log")
+        latest_txt_path = os.path.join(self.log_dir, "latest_audit.log")
+        json_path = os.path.join(self.log_dir, "latest_audit.json")
+
+        clean_report = strip_ansi(text_report)
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(clean_report)
+            f.write("\n\n=== RAW TELEMETRY DUMP ===\n")
+            f.write(json.dumps(self.cage_results, indent=2, ensure_ascii=False))
+
+        # Обновляем latest_audit.log
+        try:
+            with open(latest_txt_path, "w", encoding="utf-8") as f:
+                f.write(clean_report)
+        except Exception:
+            pass
+
+        # Сохраняем JSON отчет
+        full_json = {
+            "meta": {
+                "version": VERSION,
+                "timestamp": timestamp,
+                "profile": self.profile,
+                "score": self.score,
+                "vulnerabilities": self.vulnerabilities,
+                "warnings": self.warnings
+            },
+            "host_baseline": self.host_baseline,
+            "verdicts": self.verdicts,
+            "cage_telemetry": self.cage_results
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(full_json, f, indent=2, ensure_ascii=False)
+
+        return txt_path, json_path
+
+# ==============================================================================
+# Режим Живого Мониторинга (Live Network Monitor)
+# ==============================================================================
+def run_live_monitor(log_dir: str):
+    """Мониторинг сетевых соединений из клетки в реальном времени."""
+    print(f"{C_PURPLE + C_BOLD}=== CLAUDE-PROBE: Живой Мониторинг Трафика Клетки ==={C_RESET}")
+    print(f"Отслеживание соединений из пространства claude_vpn...")
+    print(f"Для выхода нажмите Ctrl+C\n")
+
+    log_file = os.path.join(log_dir, f"traffic_{datetime.date.today().strftime('%Y-%m-%d')}.log")
+
+    cmd = ["sudo", "/usr/local/bin/claude-vpn", "--monitor"]
+    try:
+        proc = subprocess.Popen(cmd)
+        proc.wait()
+    except KeyboardInterrupt:
+        print("\nМониторинг остановлен пользователем.")
+    except Exception as e:
+        print(f"Ошибка мониторинга: {e}")
+
+# ==============================================================================
+# Точка входа (CLI Parser)
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"ClaudeCage Probe v{VERSION}: Network Visibility & Leak Audit Logger",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры использования:
+  claude-probe               # Полный комплексный аудит сети и лазеек
+  claude-probe --monitor     # Живой мониторинг сетевых соединений в реальном времени
+  claude-probe --cli         # Проверка профиля CLI (Node.js/bash)
+  claude-probe --desktop     # Проверка профиля Desktop (Electron/WebRTC)
+  claude-probe --json        # Вывод результатов в формате JSON
+        """
+    )
+    parser.add_argument("--audit", action="store_true", default=True, help="Запустить комплексный аудит (по умолчанию)")
+    parser.add_argument("--cli", action="store_true", help="Аудит в профиле Claude Code CLI")
+    parser.add_argument("--desktop", action="store_true", help="Аудит в профиле Claude Desktop (Electron)")
+    parser.add_argument("-m", "--monitor", "--watch", action="store_true", help="Режим живого мониторинга трафика клетки")
+    parser.add_argument("--json", action="store_true", help="Вывод отчета строго в JSON")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Подробный вывод технической информации")
+    parser.add_argument("--no-save", action="store_true", help="Не сохранять отчет в лог-файл")
+    parser.add_argument("--log-dir", type=str, default=None, help="Кастомный каталог для сохранения логов")
+    parser.add_argument("--no-color", action="store_true", help="Отключить ANSI цвета")
+
+    args = parser.parse_args()
+
+    profile = "both"
+    if args.cli:
+        profile = "cli"
+    elif args.desktop:
+        profile = "desktop"
+
+    probe = ClaudeProbe(
+        target_profile=profile,
+        verbose=args.verbose,
+        no_color=args.no_color,
+        custom_log_dir=args.log_dir
+    )
+
+    if args.monitor:
+        run_live_monitor(probe.log_dir)
+        sys.exit(0)
+
+    # 1. Сбор базовых метрик хоста
+    probe.collect_host_baseline()
+
+    # 2. Внутриклеточное тестирование
+    if not probe.run_cage_probe():
+        sys.exit(1)
+
+    # 3. Анализ векторов атак
+    probe.analyze_attack_vectors()
+
+    # 4. Вывод
+    if args.json:
+        full_json = {
+            "meta": {
+                "version": VERSION,
+                "profile": probe.profile,
+                "score": probe.score,
+                "vulnerabilities": probe.vulnerabilities,
+                "warnings": probe.warnings
+            },
+            "host_baseline": probe.host_baseline,
+            "verdicts": probe.verdicts,
+            "cage_telemetry": probe.cage_results
+        }
+        print(json.dumps(full_json, indent=2, ensure_ascii=False))
+    else:
+        report_text = probe.print_report()
+        if not args.no_save:
+            txt_log, json_log = probe.save_logs(report_text)
+            print(f"Подробный лог сохранён в:\n  • {txt_log}\n  • {json_log}\n")
+
+if __name__ == "__main__":
+    main()

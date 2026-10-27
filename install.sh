@@ -94,11 +94,12 @@ sudo mkdir -p /etc/sudoers.d
 
 tmp_sudoers=$(mktemp)
 cat << EOF_SUDO > "$tmp_sudoers"
-# ClaudeCage v3.0 NOPASSWD execution for claude-vpn orchestrator and celltest
+# ClaudeCage v3.0 NOPASSWD execution for claude-vpn orchestrator, celltest and claude-probe
 # !use_pty prevents TTY hijacking and LPE vulnerabilities
 Defaults!/usr/local/bin/claude-vpn !use_pty
 Defaults!/usr/local/bin/celltest !use_pty
-${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn, /usr/local/bin/celltest
+Defaults!/usr/local/bin/claude-probe !use_pty
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn, /usr/local/bin/celltest, /usr/local/bin/claude-probe
 EOF_SUDO
 
 if command -v visudo &>/dev/null && ! sudo visudo -cf "$tmp_sudoers" &>/dev/null; then
@@ -180,13 +181,21 @@ sudo cp -f "$HERE/bin/celltest" /usr/local/bin/celltest
 sudo chmod 0755 /usr/local/bin/celltest
 info "Установлена утилита диагностики celltest в ${USER_BIN}/celltest и /usr/local/bin/celltest"
 
+# Аудитор и логгер сетевой видимости claude-probe
+cp -f "$HERE/bin/claude-probe" "${USER_BIN}/claude-probe"
+chmod +x "${USER_BIN}/claude-probe"
+chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/claude-probe"
+sudo cp -f "$HERE/bin/claude-probe" /usr/local/bin/claude-probe
+sudo chmod 0755 /usr/local/bin/claude-probe
+info "Установлен логгер и аудитор claude-probe в ${USER_BIN}/claude-probe и /usr/local/bin/claude-probe"
+
 # Fish функции
 if command -v fish &>/dev/null; then
     FISH_FUNC_DIR="${TARGET_HOME}/.config/fish/functions"
     mkdir -p "$FISH_FUNC_DIR"
     cp -f "$HERE/wrappers/fish/"*.fish "$FISH_FUNC_DIR/"
     chown -R "${TARGET_USER}:${TARGET_GROUP}" "$FISH_FUNC_DIR"
-    info "Установлены fish-функции: claude, claude-desktop"
+    info "Установлены fish-функции: claude, claude-desktop, claude-probe"
 fi
 
 # Ярлык приложения (.desktop)
@@ -206,7 +215,11 @@ step "Итог установки"
 echo -e "${GREEN}${BOLD}Установка ClaudeCage v3.0 успешно завершена!${NC}"
 echo ""
 echo -e "Для комплексной диагностики защиты запустите:"
-echo -e "  ${CYAN}celltest${NC}"
+echo -e "  ${CYAN}celltest${NC}        (Проверка конфигурации ядра, nftables и watchdog)"
+echo -e "  ${CYAN}claude-probe${NC}    (Аудит сетевой видимости и логгер лазеек глазами Claude)"
+echo ""
+echo -e "Для живого мониторинга соединений клетки в реальном времени:"
+echo -e "  ${CYAN}claude-probe --monitor${NC}"
 echo ""
 echo -e "Для запуска Claude в изолированной невидимой песочнице:"
 echo -e "  ${CYAN}claude${NC}          (CLI версия)"

@@ -24,9 +24,13 @@ for arg in "$@"; do
     esac
 done
 
-# Авто-элевация sudo
+# Авто-элевация sudo (предпочитаем /usr/local/bin/celltest для соответствия sudoers NOPASSWD)
 if [[ $EUID -ne 0 ]]; then
-    exec sudo -- "$SELF" "$@"
+    if [[ -x /usr/local/bin/celltest ]]; then
+        exec sudo /usr/local/bin/celltest "$@"
+    else
+        exec sudo -- "$SELF" "$@"
+    fi
 fi
 
 CVPN="/usr/local/bin/claude-vpn"
