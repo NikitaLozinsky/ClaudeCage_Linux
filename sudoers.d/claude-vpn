@@ -1,5 +1,6 @@
-# ClaudeCage NOPASSWD execution for claude-vpn orchestrator
+# ClaudeCage v3.0 NOPASSWD execution for claude-vpn orchestrator and celltest
 # !use_pty prevents TTY hijacking and LPE vulnerabilities
 Defaults!/usr/local/bin/claude-vpn !use_pty
-%wheel ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn
-%sudo ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn
+Defaults!/usr/local/bin/celltest !use_pty
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn, /usr/local/bin/celltest
+%sudo ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn, /usr/local/bin/celltest

@@ -1,7 +1,11 @@
 [Unit]
-Description=ClaudeCage Network Jail and Hardened Kill Switch
-After=network-online.target
-Wants=network-online.target
+Description=ClaudeCage Network Sandbox (Fail-Closed Kill Switch)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=oneshot
@@ -10,4 +14,4 @@ ExecStart=/usr/local/bin/claude-vpn --up
 ExecStop=/usr/local/bin/claude-vpn --down
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target sysinit.target

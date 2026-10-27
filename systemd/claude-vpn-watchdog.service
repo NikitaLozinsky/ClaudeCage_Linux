@@ -1,0 +1,14 @@
+[Unit]
+Description=ClaudeCage Watchdog (Netlink monitor, self-heal, socket purge)
+After=claude-vpn.service
+PartOf=claude-vpn.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/claude-vpn --watchdog-loop
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

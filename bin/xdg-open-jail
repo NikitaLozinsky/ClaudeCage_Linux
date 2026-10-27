@@ -1,21 +1,41 @@
 #!/bin/sh
 # ==============================================================================
-# xdg-open-jail — Перехватчик открытия внешних ссылок из сетевой клетки
-# Предотвращает открытие хостового браузера вне VPN-туннеля
+# Desktop URL Handler — Safe Link Forwarder
+# Intercepts browser requests, copies URLs to system clipboard
+# and notifies the user without opening host browsers outside the tunnel.
 # ==============================================================================
+set -u
 
-# Копирование ссылки в буфер обмена (X11 + Wayland)
-printf '%s' "$1" | xclip -selection clipboard 2>/dev/null || true
-command -v wl-copy >/dev/null 2>&1 && printf '%s' "$1" | wl-copy 2>/dev/null || true
+url=${1:-}
+[ -n "$url" ] || exit 1
 
-# Экранирование спецсимволов HTML-разметки (<, >, &) для защиты от кликабельных ссылок в уведомлениях
-escaped_url=$(printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+# Filter control characters
+clean_url=$(printf '%s' "$url" | tr -d '\000-\037\177')
 
-# Безопасная отправка уведомления: ТОЛЬКО через изолированный сокет-прокси (если активен)
-NOTIFY_PROXY="/run/user/$(id -u)/claude_vpn_notify.sock"
-if [ -S "$NOTIFY_PROXY" ]; then
-    DBUS_SESSION_BUS_ADDRESS="unix:path=$NOTIFY_PROXY" notify-send -u critical "Claude VPN Jail" "Ссылка скопирована в буфер обмена (открытие на хосте заблокировано): $escaped_url" 2>/dev/null || true
+# Protocol check
+case $clean_url in
+    http://*|https://*|mailto:*) ;;
+    *) echo "[link-handler] Protocol not allowed: ${clean_url%%:*}" >&2; exit 1 ;;
+esac
+
+# Escape special HTML characters
+escaped_url=$(printf '%s' "$clean_url" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+
+# Copy to clipboard (X11 & Wayland)
+copied="no"
+if [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$clean_url" | xclip -selection clipboard 2>/dev/null && copied="yes"
+fi
+if [ "$copied" = "no" ] && command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$clean_url" | wl-copy 2>/dev/null && copied="yes"
 fi
 
-echo "[claude-vpn] URL скопирован в буфер обмена (открытие на хосте заблокировано): $escaped_url" >&2
+# Send desktop notification via proxy if active
+NOTIFY_PROXY="/run/user/$(id -u)/claude_jail_notify.sock"
+if [ -S "$NOTIFY_PROXY" ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$NOTIFY_PROXY" notify-send -u normal \
+        "Link Handler" "URL copied to clipboard: $escaped_url" 2>/dev/null || true
+fi
+
+echo "[link-handler] URL copied to clipboard: $clean_url" >&2
 exit 0

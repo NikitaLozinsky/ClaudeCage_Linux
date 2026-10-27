@@ -1,15 +1,17 @@
-#!/bin/sh
+#!/bin/bash
 # ============================================================
-# Claude Desktop (Electron) Transparent Wrapper
-# Runs Claude Desktop inside the hardened network namespace
+# Claude Desktop Transparent Wrapper
+# Runs Claude Desktop inside the stealth network namespace
 # ============================================================
-if [ "${CLAUDE_VPN_INTERNAL:-0}" = "1" ]; then
+if ip link show veth_ns >/dev/null 2>&1; then
     if [ -x "/usr/bin/claude-desktop" ]; then
-        exec /usr/bin/claude-desktop "$@"
+        exec "/usr/bin/claude-desktop" "$@"
     elif [ -x "/usr/lib/claude-desktop/claude-desktop" ]; then
-        exec /usr/lib/claude-desktop/claude-desktop "$@"
+        exec "/usr/lib/claude-desktop/claude-desktop" "$@"
     else
-        exec claude-desktop "$@"
+        echo "Error: claude-desktop binary not found" >&2
+        exit 127
     fi
 fi
+
 exec sudo /usr/local/bin/claude-vpn claude-desktop "$@"

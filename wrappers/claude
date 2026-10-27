@@ -1,15 +1,25 @@
 #!/bin/bash
 # ============================================================
 # Claude Code (CLI) Transparent Wrapper
-# Runs Claude inside the hardened network namespace with Kill Switch
+# Runs Claude inside the stealth network namespace with Kill Switch
 # ============================================================
-if [ "${CLAUDE_VPN_INTERNAL:-0}" = "1" ]; then
+if ip link show veth_ns >/dev/null 2>&1; then
     if [ -x "$HOME/.local/bin/claude-raw" ]; then
         exec "$HOME/.local/bin/claude-raw" "$@"
     elif [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
         exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
     else
-        exec claude "$@"
+        echo "Error: raw claude binary not found (expected ~/.local/bin/claude-raw)" >&2
+        exit 127
     fi
 fi
+
+case "$PWD" in
+    *ClaudeCage*|*claude-vpn*|*claudecage*)
+        echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
+        echo "Чтобы агент не обнаружил файлы клетки и факт изоляции, перейдите в ваш рабочий каталог проекта." >&2
+        exit 1
+        ;;
+esac
+
 exec sudo /usr/local/bin/claude-vpn claude "$@"
