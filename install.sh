@@ -73,7 +73,7 @@ sudo mkdir -p /usr/local/bin /usr/local/lib/claude-vpn
 
 # Сброс старой клетки перед обновлением
 if [[ -x /usr/local/bin/claude-vpn ]]; then
-    warn "Обнаружена установленная версия claude-vpn: сбрасываю старое пространство..."
+    info "Обнаружена ранее установленная версия claude-vpn: корректная остановка старого пространства перед обновлением..."
     sudo /usr/local/bin/claude-vpn --down >/dev/null 2>&1 || true
 fi
 
