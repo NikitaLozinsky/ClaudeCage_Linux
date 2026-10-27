@@ -325,11 +325,12 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
     fi
 
     # 4.5. Маскировка сетевых интерфейсов в /sys/class/net
-    sys_links=$(cvpn_exec /bin/bash -c 'ls -1 /sys/class/net 2>/dev/null | tr "\n" " "' 2>/dev/null || echo "")
-    if [[ "$sys_links" == *"lo"* && "$sys_links" == *"veth_ns"* && "$sys_links" != *"wlan"* && "$sys_links" != *"eth"* ]]; then
-        pass "/sys/class/net содержит только 'lo' и 'veth_ns' (физические Wi-Fi/Ethernet скрыты)"
+    sys_links=$(cvpn_exec /bin/bash -c 'ls -1 /sys/class/net 2>/dev/null | sort | tr "\n" " "' 2>/dev/null || echo "")
+    trimmed_links=$(echo "$sys_links" | xargs)
+    if [[ "$trimmed_links" == "lo veth_ns" || "$trimmed_links" == "veth_ns lo" ]]; then
+        pass "/sys/class/net содержит строго 'lo' и 'veth_ns' (все физические интерфейсы хоста скрыты)"
     else
-        warn "/sys/class/net интерфейсы внутри: $sys_links (проверьте сокрытие)"
+        warn "/sys/class/net содержит посторонние интерфейсы: '$sys_links' (проверьте сокрытие)"
     fi
 
     # 4.6. Hostname
