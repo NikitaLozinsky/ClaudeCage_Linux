@@ -15,11 +15,11 @@ if ip link show veth_ns >/dev/null 2>&1; then
 fi
 
 case "$PWD" in
-    *ClaudeCage*|*claude-vpn*|*claudecage*)
+    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*)
         echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
         echo "Чтобы агент не обнаружил файлы клетки и факт изоляции, перейдите в ваш рабочий каталог проекта." >&2
         exit 1
         ;;
 esac
 
-exec sudo /usr/local/bin/claude-vpn claude "$@"
+exec sudo /usr/local/bin/cld-cage claude "$@"

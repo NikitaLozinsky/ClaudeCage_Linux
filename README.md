@@ -38,7 +38,7 @@ flowchart TD
         BWRAP["📦 Песочница bwrap (--overlay-src /etc, маскировка /run/dbus и systemd --user)"]
         TTY_FIX["⌨️ Честный TTY для CLI (полная поддержка Ctrl+C и SIGINT без --new-session)"]
         DBUS["🔒 Изолированная шина D-Bus (dbus-run-session + xdg-open-jail)"]
-        NETNS["🌐 Сетевой стек ядра (ip netns claude_vpn + veth 10.200.1.0/24)"]
+        NETNS["🌐 Сетевой стек ядра (ip netns cld_net + veth 10.200.1.0/24)"]
         NFT["🧱 24/7 Аппаратный Kill Switch nftables (Drop выше ct established)"]
         DNAT["📋 Принудительный DNAT DNS (Порт 53 -> Резолвер VPN)"]
         WD["👁️ Systemd Watchdog Демон (Netlink мониторинг + авто-лечение + сброс сокетов ss -K)"]
@@ -84,7 +84,7 @@ flowchart TD
 ## 🛡️ 3. Шесть эшелонов обороны ядра v3.0
 
 ### Эшелон 1: Сетевой Namespace ядра (`ip netns`)
-Процессы Claude помещаются в изолированное сетевое пространство `claude_vpn`. У них **физически отсутствуют** адаптеры `wlan0`, `eth0` или Docker-мосты. Связь с хостом происходит исключительно по виртуальному патч-корду `veth_host (10.200.1.1) <-> veth_ns (10.200.1.2)`. IPv6 внутри клетки аппаратно отключен (`disable_ipv6=1`), исключая утечки через IPv6 SLAAC/DHCPv6.
+Процессы Claude помещаются в изолированное сетевое пространство `cld_net`. У них **физически отсутствуют** адаптеры `wlan0`, `eth0` или Docker-мосты. Связь с хостом происходит исключительно по виртуальному патч-корду `veth_host (10.200.1.1) <-> veth_ns (10.200.1.2)`. IPv6 внутри клетки аппаратно отключен (`disable_ipv6=1`), исключая утечки через IPv6 SLAAC/DHCPv6.
 
 ### Эшелон 2: Аппаратный сетевой фильтр `nftables` (Hard Kill Switch)
 - **DROP выше conntrack**: Правило сброса `iifname "veth_host" oifname != "$VPN_IFACE" counter drop` расположено **строго выше** `ct state established,related accept`.
@@ -96,7 +96,7 @@ flowchart TD
 ### Эшелон 3: Песочница файловой системы и Стелс-сокрытие (`bubblewrap`)
 - **Безопасный сброс привилегий**: `setpriv` сбрасывает UID/GID до непривилегированного пользователя с очисткой возможностей (`--inh-caps=-all`, `--no-new-privs`) **до** входа в `bwrap`, блокируя любые попытки LPE-побега через `sudo`.
 - **Сокрытие репозитория ClaudeCage**: Каталог репозитория клетки монтируется как пустой `tmpfs`. Если агент попытается выполнить `ls` или просканировать домашнюю директорию, он увидит пустую папку.
-- **Сокрытие служебных бинарников и служб**: Файлы `/usr/local/bin/claude-vpn`, `/etc/claude-vpn.conf`, `/etc/systemd/system/claude-vpn*` полностью удалены из файловой системы внутри сэндбокса через оверлеи.
+- **Сокрытие служебных бинарников и служб**: Файлы `/usr/local/bin/cld-cage`, `/etc/cld-cage.conf`, `/etc/systemd/system/cld-cage*` полностью удалены из файловой системы внутри сэндбокса через оверлеи.
 - **Маскировка `/sys/class/net`**: Внутри песочницы создана чистая виртуальная структура интерфейсов, содержащая только `lo` и `veth_ns`. Физические адаптеры `wlan0` и `eth0` не видны.
 - **Естественный Hostname**: Hostname внутри песочницы наследует имя реального компьютера хоста (без выдающих песочницу названий вроде `claude-jail`).
 
@@ -111,9 +111,9 @@ flowchart TD
 - **Перехватчик ссылок (`xdg-open-jail`)**: Перехватывает URL, копирует в буфер обмена и отправляет нейтральное уведомление на хост через фильтрованный сокет-прокси `xdg-dbus-proxy` (разрешён только `org.freedesktop.Notifications`).
 
 ### Эшелон 6: Systemd Watchdog демон реального времени (Netlink)
-- Фоновый демон оформлен в виде системной службы `claude-vpn-watchdog.service` с `KillMode=control-group`.
+- Фоновый демон оформлен в виде системной службы `cld-cage-watchdog.service` с `KillMode=control-group`.
 - Слушает события ядра через Netlink (`ip -o monitor link addr`).
-- Основная служба `claude-vpn.service` запускается с директивами `Before=network-pre.target` и `Wants=network-pre.target`, гарантируя Fail-Closed защиту с первой секунды загрузки ОС до поднятия сетевых интерфейсов.
+- Основная служба `cld-cage.service` запускается с директивами `Before=network-pre.target` и `Wants=network-pre.target`, гарантируя Fail-Closed защиту с первой секунды загрузки ОС до поднятия сетевых интерфейсов.
 - При падении туннеля VPN вызывается `ss -K dst != 127.0.0.0/8`: ядро мгновенно рвёт внешние соединения, но **сохраняет loopback `127.0.0.1`**, гарантируя бесперебойную работу локальных MCP-серверов и IPC Claude Code.
 
 ---
@@ -134,10 +134,10 @@ cd ClaudeCage_Linux
 
 Инсталлятор в автоматическом режиме:
 1. Проверит наличие всех необходимых зависимостей и синтаксис скриптов.
-2. Установит системный оркестратор `/usr/local/bin/claude-vpn` с правами `root:root 0755`.
+2. Установит системный оркестратор `/usr/local/bin/cld-cage` с правами `root:root 0755` (с алиасом `claude-vpn`).
 3. Сконфигурирует безопасный `sudoers` с предварительной валидацией через `visudo -c`.
 4. Автоматически определит активный VPN-интерфейс (`amn0`, `wg0`, `tun0`, `proton0`).
-5. Установит systemd-службы `claude-vpn.service` и `claude-vpn-watchdog.service`.
+5. Установит systemd-службы `cld-cage.service` и `cld-cage-watchdog.service`.
 6. Настроит прозрачные обёртки в `~/.local/bin/` с защитой от запуска внутри репозитория клетки.
 7. Интегрирует Fish-функции и меню приложений.
 
@@ -158,20 +158,20 @@ celltest
 ╚══════════════════════════════════════════════════════════════════╝
 
 ━━━ 1. Ядро Linux и Сетевой Namespace (Netns) ━━━
-  ✔ Сетевое пространство (netns) 'claude_vpn' создано в ядре
+  ✔ Сетевое пространство (netns) 'cld_net' создано в ядре
   ✔ Интерфейс veth_host на хосте активен (10.200.1.1)
   ✔ Фильтрация обратного пути (rp_filter=2) на veth_host
   ✔ IPv6 на хостовом конце veth_host отключён (disable_ipv6=1)
   ✔ Интерфейс veth_ns внутри netns активен (10.200.1.2)
   ✔ IPv6 внутри клетки полностью отключён (0 утечек через IPv6 SLAAC)
-  ✔ Служба Watchdog активна (systemd: claude-vpn-watchdog.service)
+  ✔ Служба Watchdog активна (systemd: cld-cage-watchdog.service)
 
 ━━━ 2. Двухуровневый Fail-Closed Kill Switch ━━━
   ✔ VPN интерфейс (amn0) активен: 100.x.x.x
   ✔ Policy Routing rule активно (iif veth_host lookup 200, prio 100)
   ✔ Fail-Closed fallback маршрут активен (unreachable default table 200)
   ✔ Маршрут egress через VPN активен в table 200 (dev amn0 metric 10)
-  ✔ Таблица nftables 'inet claude_vpn_nat' загружена в ядре
+  ✔ Таблица nftables 'inet cld_cage_nat' загружена в ядре
   ✔ Аппаратный Kill Switch активен (DROP выше conntrack established)
   ✔ Защита от подмены IP активна (iifname veth_host ip saddr != 10.200.1.2 drop)
   ✔ Динамический MSS Clamping активен (tcp option maxseg size set rt mtu)
@@ -186,8 +186,8 @@ celltest
 
 ━━━ 4. Невидимость и Сокрытие Клетки от ИИ-Агента ━━━
   ✔ Каталог ClaudeCage полностью скрыт (пустой tmpfs)
-  ✔ Бинарник /usr/local/bin/claude-vpn скрыт из файловой системы песочницы
-  ✔ Конфиг /etc/claude-vpn.conf скрыт из файловой системы песочницы
+  ✔ Бинарники cld-cage / claude-vpn скрыты из файловой системы песочницы
+  ✔ Конфиг /etc/cld-cage.conf скрыт из файловой системы песочницы
   ✔ Службы systemd клетки скрыты из /etc/systemd/system
   ✔ /sys/class/net содержит только 'lo' и 'veth_ns' (физические Wi-Fi/Ethernet скрыты)
   ✔ Имя хоста внутри клетки естественное: 'archarnel' (без подозрительных меток 'jail')
@@ -221,23 +221,23 @@ celltest --disruptive
 
 ---
 
-## 🔍 5.1 `claude-probe`: Логгер и Аудитор Сетевой Видимости Глазами Claude
+## 🔍 5.1 `cld-probe`: Логгер и Аудитор Сетевой Видимости Глазами Claude
 
-В то время как `celltest` проверяет административную конфигурацию ядра и служб, инструмент **`claude-probe`** выполняет активный аудит безопасности **строго изнутри клетки глазами самого ИИ-агента**. Он имитирует действия исследователя или атакующего агента (как в CLI через Node.js/curl, так и в GUI через Electron/WebRTC) и фиксирует все лазейки в подробный структурированный лог:
+В то время как `celltest` проверяет административную конфигурацию ядра и служб, инструмент **`cld-probe`** (алиас: `claude-probe`) выполняет активный аудит безопасности **строго изнутри клетки глазами самого ИИ-агента**. Он имитирует действия исследователя или атакующего агента (как в CLI через Node.js/curl, так и в GUI через Electron/WebRTC) и фиксирует все лазейки в подробный структурированный лог:
 
 ```bash
-claude-probe              # Комплексный аудит всех 8 векторов атак и запись лога
-claude-probe --monitor    # Живой потоковый мониторинг сетевых соединений клетки (Ctrl+C для выхода)
-claude-probe --cli        # Аудит в профиле Claude Code CLI (Node.js/bash)
-claude-probe --desktop    # Аудит в профиле Claude Desktop (Electron/Chromium)
-claude-probe --json       # Вывод структурированного отчета в JSON
+cld-probe              # Комплексный аудит всех 8 векторов атак и запись лога
+cld-probe --monitor    # Живой потоковый мониторинг сетевых соединений клетки (Ctrl+C для выхода)
+cld-probe --cli        # Аудит в профиле Claude Code CLI (Node.js/bash)
+cld-probe --desktop    # Аудит в профиле Claude Desktop (Electron/Chromium)
+cld-probe --json       # Вывод структурированного отчета в JSON
 ```
 
 ### Пример вывода аудита:
 
 ```text
 ╔══════════════════════════════════════════════════════════════════╗
-║    CLAUDE-PROBE v1.0-stealth: Network Visibility & Leak Audit Logger     ║
+║    CLD-PROBE v1.0-stealth: Network Visibility & Leak Audit Logger ║
 ║         Телеметрия сети и аудит лазеек глазами Claude            ║
 ╚══════════════════════════════════════════════════════════════════╝
 Время аудита: 2026-10-27 21:45:42 | Профиль: BOTH | Пользователь: milk13
@@ -270,9 +270,9 @@ claude-probe --json       # Вывод структурированного от
   Вердикт: ПОЛНАЯ ИЗОЛЯЦИЯ: 100% STEALTH (Лазейки закрыты, утечек нет)
 
 Подробный лог сохранён в:
-  • ~/.local/state/claude-vpn/audit_YYYYMMDD_HHMMSS.log
-  • ~/.local/state/claude-vpn/latest_audit.log
-  • ~/.local/state/claude-vpn/latest_audit.json
+  • ~/.local/state/cld-cage/audit_YYYYMMDD_HHMMSS.log
+  • ~/.local/state/cld-cage/latest_audit.log
+  • ~/.local/state/cld-cage/latest_audit.json
 ```
 
 ---
@@ -289,15 +289,15 @@ claude
 claude-desktop
 
 # Выполнение любой утилиты внутри изолированной песочницы
-claude-vpn ping -c 1 127.0.0.1
-claude-vpn curl https://icanhazip.com
+cld-cage ping -c 1 127.0.0.1
+cld-cage curl https://icanhazip.com
 
 # Служебные команды оркестратора и аудита
-claude-probe             # Полный аудит сетевой видимости и запись отчета
-claude-probe --monitor   # Живой мониторинг соединений клетки в реальном времени
-claude-vpn --status      # Подробный статус туннеля, netns, MTU и маршрутов
-claude-vpn --up          # Принудительное поднятие сети клетки
-claude-vpn --down        # Полная очистка правил nftables и удаление netns
+cld-probe                # Полный аудит сетевой видимости и запись отчета
+cld-probe --monitor      # Живой мониторинг соединений клетки в реальном времени
+cld-cage --status        # Подробный статус туннеля, netns, MTU и маршрутов
+cld-cage --up            # Принудительное поднятие сети клетки
+cld-cage --down          # Полная очистка правил nftables и удаление netns
 ```
 
 > [!IMPORTANT]
@@ -305,9 +305,9 @@ claude-vpn --down        # Полная очистка правил nftables и 
 
 ---
 
-## ⚙️ 7. Конфигурация (`/etc/claude-vpn.conf`)
+## ⚙️ 7. Конфигурация (`/etc/cld-cage.conf`)
 
-Конфигурационный файл располагается в `/etc/claude-vpn.conf` (владелец `root:root 0644`):
+Конфигурационный файл располагается в `/etc/cld-cage.conf` (владелец `root:root 0644`, поддерживается fallback на `/etc/claude-vpn.conf`):
 
 ```ini
 # Сетевой интерфейс вашего VPN-клиента (default: amn0)
@@ -320,7 +320,7 @@ VPN_DNS="100.64.0.1"
 VPN_PROBE="1.1.1.1"
 
 # Эмулируемый часовой пояс (должен соответствовать локации вашего VPN)
-CLAUDE_TZ="Europe/Amsterdam"
+CLD_TZ="Europe/Amsterdam"
 
 # Путь к локальному репозиторию ClaudeCage для сокрытия от агента
 CAGE_REPO_DIR="/home/milk13/ClaudeCage_Linux"
@@ -330,7 +330,7 @@ CAGE_REPO_DIR="/home/milk13/ClaudeCage_Linux"
 
 ## 🔒 8. Безопасность и защита от LPE
 
-- **Исключение LPE (Local Privilege Escalation)**: Оркестратор расположен в системной директории `/usr/local/bin/claude-vpn` с владельцем `root:root` и правами `0755`. В конфигурации `sudoers` директива `!use_pty` блокирует атаки внедрения команд через TTY (TIOCSTI).
+- **Исключение LPE (Local Privilege Escalation)**: Оркестратор расположен в системной директории `/usr/local/bin/cld-cage` с владельцем `root:root` и правами `0755`. В конфигурации `sudoers` директива `!use_pty` блокирует атаки внедрения команд через TTY (TIOCSTI).
 - **Безопасный парсинг**: Параметры конфигурации извлекаются с помощью регулярных выражений **без использования команды `source`**.
 - **Сохранение интерактивности TTY**: Прямой вызов `exec` без промежуточных sudo-оболочек сохраняет обработку сигналов `SIGWINCH` (ресайз окна терминала) и `SIGINT` (Ctrl+C).
 

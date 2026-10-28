@@ -4,17 +4,18 @@
 # Multi-layered defense-in-depth, Anti-Fraud & Zero-Leak Kernel Isolation
 # ==============================================================================
 # Commands:
-#   claude-vpn --up               Bring up netns, veth, policy routing, nftables & watchdog
-#   claude-vpn --down             Tear down netns, policy routing, nftables & watchdog
-#   claude-vpn --status           Show network status, VPN status, drop counters
-#   claude-vpn --watchdog-loop    Internal watchdog daemon (run by systemd or background)
-#   claude-vpn --print-config     Internal config output for celltest diagnostics
-#   claude-vpn <app> [args...]    Run command/app inside the stealth sandbox
+#   cld-cage --up               Bring up netns, veth, policy routing, nftables & watchdog
+#   cld-cage --down             Tear down netns, policy routing, nftables & watchdog
+#   cld-cage --status           Show network status, VPN status, drop counters
+#   cld-cage --monitor          Live monitor connections from cage in real-time
+#   cld-cage --watchdog-loop    Internal watchdog daemon (run by systemd or background)
+#   cld-cage --print-config     Internal config output for celltest diagnostics
+#   cld-cage <app> [args...]    Run command/app inside the stealth sandbox
 # ==============================================================================
 set -uo pipefail
 
 readonly VERSION="3.0-stealth"
-readonly NETNS="claude_vpn"
+readonly NETNS="cld_net"
 readonly VETH_HOST="veth_host"
 readonly VETH_NS="veth_ns"
 readonly SUBNET="10.200.1"
@@ -24,22 +25,23 @@ readonly PREFIX=24
 readonly RT_TABLE=200
 readonly RT_PRIO=100
 readonly DEFAULT_MTU=1376
-readonly NFT_TABLE="claude_vpn_nat"
-readonly WD_UNIT="claude-vpn-watchdog.service"
-readonly MAIN_UNIT="claude-vpn.service"
-readonly JAIL_XDG_OPEN="/usr/local/lib/claude-vpn/xdg-open-jail"
+readonly NFT_TABLE="cld_cage_nat"
+readonly WD_UNIT="cld-cage-watchdog.service"
+readonly MAIN_UNIT="cld-cage.service"
+readonly JAIL_XDG_OPEN="/usr/local/lib/cld-cage/xdg-open-jail"
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
-CONF_FILE="/etc/claude-vpn.conf"
-STATE_DIR="/run/claude-vpn"
+CONF_FILE="/etc/cld-cage.conf"
+STATE_DIR="/run/cld-cage"
 PID_FILE="${STATE_DIR}/watchdog.pid"
 TICK=10
 
-# Default configuration values (overridden by /etc/claude-vpn.conf)
+# Default configuration values (overridden by /etc/cld-cage.conf or /etc/claude-vpn.conf)
 VPN_IFACE="amn0"
 VPN_DNS="100.64.0.1"
 VPN_PROBE="1.1.1.1"
 CLAUDE_TZ="Europe/Amsterdam"
+CLD_TZ="Europe/Amsterdam"
 CAGE_REPO_DIR=""
 
 readonly IFACE_RE='^[A-Za-z0-9_.-]{1,15}$'
@@ -72,6 +74,9 @@ conf_get() {
 
 load_config() {
     local f=$CONF_FILE v owner mode
+    if [[ ! -e $f && -e "/etc/claude-vpn.conf" ]]; then
+        f="/etc/claude-vpn.conf"
+    fi
     [[ -e $f ]] || return 0
     read -r owner mode < <(stat -c '%u %a' "$f" 2>/dev/null || echo "1 777")
     if [[ $owner != 0 ]] || (( (8#$mode & 8#022) != 0 )); then
@@ -84,8 +89,9 @@ load_config() {
     if [[ -n $v ]]; then [[ $v =~ $IPV4_RE ]] || { err "VPN_DNS некорректен: '$v'"; return 1; }; VPN_DNS=$v; fi
     v=$(conf_get "$f" VPN_PROBE)
     if [[ -n $v ]]; then [[ $v =~ $IPV4_RE ]] || { err "VPN_PROBE некорректен: '$v'"; return 1; }; VPN_PROBE=$v; fi
-    v=$(conf_get "$f" CLAUDE_TZ)
-    if [[ -n $v ]]; then [[ $v =~ $TZ_RE ]] || { err "CLAUDE_TZ некорректен: '$v'"; return 1; }; CLAUDE_TZ=$v; fi
+    v=$(conf_get "$f" CLD_TZ)
+    [[ -z $v ]] && v=$(conf_get "$f" CLAUDE_TZ)
+    if [[ -n $v ]]; then [[ $v =~ $TZ_RE ]] || { err "CLD_TZ некорректен: '$v'"; return 1; }; CLD_TZ=$v; CLAUDE_TZ=$v; fi
     v=$(conf_get "$f" CAGE_REPO_DIR)
     if [[ -n $v ]]; then CAGE_REPO_DIR=$v; fi
     return 0
@@ -189,12 +195,12 @@ setup_nftables() {
 }
 
 host_hooks_have() {
-    [[ $(nft list chain inet filter forward 2>/dev/null | grep -c 'comment "claude-vpn"') -ge 2 ]]
+    [[ $(nft list chain inet filter forward 2>/dev/null | grep -c -E 'comment "(cld-cage|claude-vpn)"') -ge 2 ]]
 }
 host_hooks_down() {
     local h
     nft list chain inet filter forward &>/dev/null || return 0
-    for h in $(nft -a list chain inet filter forward 2>/dev/null | grep 'comment "claude-vpn"' | awk '{print $NF}'); do
+    for h in $(nft -a list chain inet filter forward 2>/dev/null | grep -E 'comment "(cld-cage|claude-vpn)"' | awk '{print $NF}'); do
         nft delete rule inet filter forward handle "$h" 2>/dev/null || true
     done
 }
@@ -202,8 +208,8 @@ host_hooks_up() {
     nft list chain inet filter forward &>/dev/null || return 0
     host_hooks_have && return 0
     host_hooks_down
-    nft insert rule inet filter forward iifname "$VPN_IFACE" oifname "$VETH_HOST" ct state established,related accept comment '"claude-vpn"' 2>/dev/null &&
-        nft insert rule inet filter forward iifname "$VETH_HOST" oifname "$VPN_IFACE" accept comment '"claude-vpn"' 2>/dev/null || true
+    nft insert rule inet filter forward iifname "$VPN_IFACE" oifname "$VETH_HOST" ct state established,related accept comment '"cld-cage"' 2>/dev/null &&
+        nft insert rule inet filter forward iifname "$VETH_HOST" oifname "$VPN_IFACE" accept comment '"cld-cage"' 2>/dev/null || true
 }
 
 # ── Netns & Virtual Ethernet ─────────────────────────────────────
@@ -440,13 +446,13 @@ cmd_status() {
 
 cmd_monitor() {
     load_config || exit 1
-    netns_exists || die "Сетевое пространство $NETNS не запущено. Запустите: claude-vpn --up"
+    netns_exists || die "Сетевое пространство $NETNS не запущено. Запустите: cld-cage --up"
     
     echo -e "${C_B}${C_C}=== Мониторинг сетевых соединений ClaudeCage ($NETNS) ===${C_0}"
     echo -e "Отслеживание активных сокетов и пакетов из клетки (IP $NS_IP)..."
     echo -e "Нажмите Ctrl+C для выхода.\n"
     
-    local log_dir="${REAL_HOME:-$HOME}/.local/state/claude-vpn"
+    local log_dir="${REAL_HOME:-$HOME}/.local/state/cld-cage"
     mkdir -p "$log_dir" 2>/dev/null || true
     local log_file="${log_dir}/traffic_$(date +%Y-%m-%d).log"
     
@@ -473,6 +479,7 @@ cmd_print_config() {
 VPN_IFACE=$VPN_IFACE
 VPN_DNS=$VPN_DNS
 VPN_PROBE=$VPN_PROBE
+CLD_TZ=$CLD_TZ
 CLAUDE_TZ=$CLAUDE_TZ
 CAGE_REPO_DIR=$CAGE_REPO_DIR
 NETNS=$NETNS
@@ -497,14 +504,14 @@ resolve_user() {
     REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
     [[ -n $REAL_HOME ]] || return 1
     XDG_RUNTIME="/run/user/${REAL_UID}"
-    PROXY_SOCK="${XDG_RUNTIME}/claude_jail_notify.sock"
+    PROXY_SOCK="${XDG_RUNTIME}/cld_jail_notify.sock"
 }
 
 synthetic_machine_id() {
     local f="$STATE_DIR/machine-id"
     if [[ ! -s $f ]]; then
         mkdir -p "$STATE_DIR"
-        printf 'claude-stealth-host:%s:%s' "$REAL_USER" "$(cat /etc/machine-id 2>/dev/null)" | sha256sum | head -c 32 >"$f"
+        printf 'cld-stealth-host:%s:%s' "$REAL_USER" "$(cat /etc/machine-id 2>/dev/null)" | sha256sum | head -c 32 >"$f"
         echo >>"$f"
         chmod 644 "$f"
     fi
@@ -514,7 +521,7 @@ synthetic_machine_id() {
 proxy_start() {
     command -v xdg-dbus-proxy >/dev/null 2>&1 || return 0
     [[ -S ${XDG_RUNTIME}/bus ]] || return 0
-    if [[ -S $PROXY_SOCK ]] && pgrep -u "$REAL_UID" -f 'xdg-dbus-proxy .*claude_jail_notify\.sock' >/dev/null; then return 0; fi
+    if [[ -S $PROXY_SOCK ]] && pgrep -u "$REAL_UID" -f 'xdg-dbus-proxy .*cld_jail_notify\.sock' >/dev/null; then return 0; fi
     rm -f "$PROXY_SOCK"
     setsid --fork setpriv --reuid="$REAL_UID" --regid="$REAL_GID" --init-groups \
         xdg-dbus-proxy "unix:path=${XDG_RUNTIME}/bus" "$PROXY_SOCK" \
@@ -551,7 +558,7 @@ cmd_run() {
     # Действует ТОЛЬКО при запуске Claude (CLI или Desktop), чтобы не блокировать служебные команды, probe и celltest
     if [[ "$base" == "claude" || "$base" == "claude-desktop" || "$base" == "claude-raw" ]]; then
         local current_pwd="${PWD:-}"
-        if [[ -n "$CAGE_REPO_DIR" && "$current_pwd" == "$CAGE_REPO_DIR"* ]] || [[ "$current_pwd" =~ ClaudeCage|claudecage|claude-vpn ]]; then
+        if [[ -n "$CAGE_REPO_DIR" && "$current_pwd" == "$CAGE_REPO_DIR"* ]] || [[ "$current_pwd" =~ ClaudeCage|claudecage|claude-vpn|cld-cage ]]; then
             err "БЕЗОПАСНОСТЬ: Запуск Claude Code внутри каталога ClaudeCage запрещён!"
             echo "Чтобы ИИ-агент не обнаружил файлы клетки и факт изоляции, перейдите в ваш рабочий каталог проекта."
             exit 1
@@ -562,7 +569,7 @@ cmd_run() {
     local user_local_bin="${REAL_HOME}/.local/bin"
     case $base in
         claude)
-            if [[ -e "${user_local_bin}/claude" ]] && ! grep -q "claude-vpn" "${user_local_bin}/claude" 2>/dev/null; then
+            if [[ -e "${user_local_bin}/claude" ]] && ! grep -q -E "cld-cage|claude-vpn" "${user_local_bin}/claude" 2>/dev/null; then
                 info "Обнаружено обновление Claude CLI (npm перезаписал перехватчик). Восстанавливаю обёртку..."
                 mv -f "${user_local_bin}/claude" "${user_local_bin}/claude-raw"
                 cat << 'EOF_WRAP' > "${user_local_bin}/claude"
@@ -574,13 +581,13 @@ if ip link show veth_ns >/dev/null 2>&1; then
     fi
 fi
 case "$PWD" in
-    *ClaudeCage*|*claude-vpn*|*claudecage*)
+    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*)
         echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
         echo "Перейдите в каталог вашего рабочего проекта." >&2
         exit 1
         ;;
 esac
-exec sudo /usr/local/bin/claude-vpn claude "$@"
+exec sudo /usr/local/bin/cld-cage claude "$@"
 EOF_WRAP
                 chmod +x "${user_local_bin}/claude"
                 chown "${REAL_USER}:${REAL_USER}" "${user_local_bin}/claude" "${user_local_bin}/claude-raw" 2>/dev/null || true
@@ -684,7 +691,7 @@ EOF_WRAP
         bw+=(--tmpfs "$CAGE_REPO_DIR")
     fi
     local cdir
-    for cdir in "${REAL_HOME}"/*ClaudeCage* "${REAL_HOME}"/*claude-vpn* "${REAL_HOME}"/*claudecage*; do
+    for cdir in "${REAL_HOME}"/*ClaudeCage* "${REAL_HOME}"/*claude-vpn* "${REAL_HOME}"/*claudecage* "${REAL_HOME}"/*cld-cage*; do
         if [[ -d "$cdir" && "$cdir" != "$CAGE_REPO_DIR" ]]; then
             bw+=(--tmpfs "$cdir")
         fi
@@ -734,10 +741,10 @@ rm -f /etc/resolv.conf 2>/dev/null || true
 printf "nameserver __VPN_DNS__\n" > /etc/resolv.conf 2>/dev/null || true
 
 # Полное удаление любых файлов и сервисов клетки из оверлеев ФС
-rm -f /etc/claude-vpn* /etc/sudoers.d/claude-vpn* 2>/dev/null || true
-rm -f /etc/systemd/system/claude-vpn* 2>/dev/null || true
-rm -f /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/claude-probe* 2>/dev/null || true
-rm -rf /usr/local/lib/claude-vpn 2>/dev/null || true
+rm -f /etc/cld-cage* /etc/claude-vpn* /etc/sudoers.d/cld-cage* /etc/sudoers.d/claude-vpn* 2>/dev/null || true
+rm -f /etc/systemd/system/cld-cage* /etc/systemd/system/claude-vpn* 2>/dev/null || true
+rm -f /usr/local/bin/cld-cage* /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/cld-probe* /usr/local/bin/claude-probe* 2>/dev/null || true
+rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn 2>/dev/null || true
 
 exec "$@"
 EOF_ENTRY
@@ -764,7 +771,7 @@ main() {
         --watchdog-loop)
             watchdog_loop; exit 0 ;;
         --help|-h|"")
-            echo "Использование: claude-vpn <команда>"
+            echo "Использование: cld-cage <команда>"
             echo ""
             echo "Управление сетью и клеткой:"
             echo "  --up               Поднять netns, veth, policy routing, nftables и watchdog"
@@ -791,7 +798,15 @@ main() {
         --down|--clean) cmd_down ;;
         --status|-s)    load_config || true; cmd_status ;;
         --monitor|-m)   load_config || exit 1; cmd_monitor "${@:2}" ;;
-        --probe)        exec /usr/local/bin/claude-probe "${@:2}" ;;
+        --probe)
+            if [[ -x /usr/local/bin/cld-probe ]]; then
+                exec /usr/local/bin/cld-probe "${@:2}"
+            elif [[ -x "$(dirname "$SELF")/cld-probe" ]]; then
+                exec "$(dirname "$SELF")/cld-probe" "${@:2}"
+            else
+                exec /usr/local/bin/claude-probe "${@:2}"
+            fi
+            ;;
         --print-config) load_config || exit 1; cmd_print_config ;;
         --*)            die "Неизвестный параметр: $1" ;;
         *)              cmd_run "$@" ;;

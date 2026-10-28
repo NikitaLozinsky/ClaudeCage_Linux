@@ -12,12 +12,14 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 echo -e "${BOLD}${RED}━━━ Удаление ClaudeCage ━━━${NC}"
 
 # 1. Остановка и сброс netns
-if command -v claude-vpn &>/dev/null; then
+if command -v cld-cage &>/dev/null; then
+    sudo /usr/local/bin/cld-cage --down 2>/dev/null || true
+elif command -v claude-vpn &>/dev/null; then
     sudo /usr/local/bin/claude-vpn --down 2>/dev/null || true
 fi
 
 # 2. Отключение и удаление systemd служб
-for unit in claude-vpn-watchdog.service claude-vpn.service; do
+for unit in cld-cage-watchdog.service cld-cage.service claude-vpn-watchdog.service claude-vpn.service; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
         sudo systemctl stop "$unit" 2>/dev/null || true
     fi
@@ -28,11 +30,11 @@ sudo systemctl daemon-reload 2>/dev/null || true
 echo -e "${GREEN}[✓]${NC} Службы systemd остановлены и удалены."
 
 # 3. Удаление системных файлов и sudoers
-sudo rm -f /usr/local/bin/claude-vpn
+sudo rm -f /usr/local/bin/cld-cage /usr/local/bin/claude-vpn
 sudo rm -f /usr/local/bin/celltest
-sudo rm -f /usr/local/bin/claude-probe
-sudo rm -rf /usr/local/lib/claude-vpn
-sudo rm -f /etc/sudoers.d/claude-vpn
+sudo rm -f /usr/local/bin/cld-probe /usr/local/bin/claude-probe
+sudo rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn
+sudo rm -f /etc/sudoers.d/cld-cage /etc/sudoers.d/claude-vpn
 echo -e "${GREEN}[✓]${NC} Системные бинарники, библиотеки и sudoers удалены."
 
 # 4. Восстановление пользовательского бинарника claude
@@ -50,11 +52,11 @@ fi
 
 rm -f "${USER_BIN}/claude-desktop"
 rm -f "${USER_BIN}/celltest"
-rm -f "${USER_BIN}/claude-probe"
-rm -f "${USER_BIN}/claude-vpn"
+rm -f "${USER_BIN}/cld-probe" "${USER_BIN}/claude-probe"
+rm -f "${USER_BIN}/cld-cage" "${USER_BIN}/claude-vpn"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude.fish"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude-desktop.fish"
-rm -f "${TARGET_HOME}/.config/fish/functions/claude-probe.fish"
+rm -f "${TARGET_HOME}/.config/fish/functions/cld-probe.fish" "${TARGET_HOME}/.config/fish/functions/claude-probe.fish"
 
 echo -e "${GREEN}${BOLD}ClaudeCage успешно удалён.${NC}"
-echo -e "Примечание: конфигурационный файл /etc/claude-vpn.conf сохранён для бэкапа."
+echo -e "Примечание: конфигурационные файлы /etc/cld-cage.conf и /etc/claude-vpn.conf сохранены для бэкапа."

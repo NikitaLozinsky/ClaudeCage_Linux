@@ -14,4 +14,4 @@ if ip link show veth_ns >/dev/null 2>&1; then
     fi
 fi
 
-exec sudo /usr/local/bin/claude-vpn claude-desktop "$@"
+exec sudo /usr/local/bin/cld-cage claude-desktop "$@"

@@ -10,5 +10,5 @@ function claude-desktop --description 'Run Claude Desktop inside isolated stealt
         end
     end
 
-    sudo /usr/local/bin/claude-vpn claude-desktop $argv
+    sudo /usr/local/bin/cld-cage claude-desktop $argv
 end

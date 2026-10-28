@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Claude
 Comment=Anthropic Claude Desktop (Jailed in ClaudeCage)
-Exec=/usr/local/bin/claude-vpn claude-desktop %u
+Exec=/usr/local/bin/cld-cage claude-desktop %u
 Icon=claude-desktop
 Type=Application
 StartupNotify=true

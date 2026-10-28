@@ -11,11 +11,11 @@ function claude --description 'Run Claude Code CLI inside isolated stealth netwo
     end
 
     switch "$PWD"
-        case "*ClaudeCage*" "*claude-vpn*" "*claudecage*"
+        case "*ClaudeCage*" "*claude-vpn*" "*claudecage*" "*cld-cage*"
             echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
             echo "Перейдите в каталог вашего рабочего проекта." >&2
             return 1
     end
 
-    sudo /usr/local/bin/claude-vpn claude $argv
+    sudo /usr/local/bin/cld-cage claude $argv
 end

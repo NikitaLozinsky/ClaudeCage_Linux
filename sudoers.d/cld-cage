@@ -1,0 +1,9 @@
+# ClaudeCage v3.0 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
+# !use_pty prevents TTY hijacking and LPE vulnerabilities
+Defaults!/usr/local/bin/cld-cage !use_pty
+Defaults!/usr/local/bin/claude-vpn !use_pty
+Defaults!/usr/local/bin/celltest !use_pty
+Defaults!/usr/local/bin/cld-probe !use_pty
+Defaults!/usr/local/bin/claude-probe !use_pty
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/cld-cage, /usr/local/bin/claude-vpn, /usr/local/bin/celltest, /usr/local/bin/cld-probe, /usr/local/bin/claude-probe
+%sudo ALL=(root) NOPASSWD: /usr/local/bin/cld-cage, /usr/local/bin/claude-vpn, /usr/local/bin/celltest, /usr/local/bin/cld-probe, /usr/local/bin/claude-probe

@@ -33,16 +33,22 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-CVPN="/usr/local/bin/claude-vpn"
+CVPN="/usr/local/bin/cld-cage"
+if [[ ! -x "$CVPN" ]]; then
+    CVPN="$(dirname "$SELF")/cld-cage"
+fi
+if [[ ! -x "$CVPN" ]]; then
+    CVPN="/usr/local/bin/claude-vpn"
+fi
 if [[ ! -x "$CVPN" ]]; then
     CVPN="$(dirname "$SELF")/claude-vpn"
 fi
-[[ -x "$CVPN" ]] || { echo "Ошибка: не найден бинарник claude-vpn!" >&2; exit 2; }
+[[ -x "$CVPN" ]] || { echo "Ошибка: не найден бинарник cld-cage!" >&2; exit 2; }
 
-# Считывание параметров из claude-vpn
-VPN_IFACE="amn0" VPN_DNS="100.64.0.1" VPN_PROBE="1.1.1.1" CLAUDE_TZ="Europe/Amsterdam"
-CAGE_REPO_DIR="" NETNS="claude_vpn" VETH_HOST="veth_host" VETH_NS="veth_ns"
-HOST_IP="10.200.1.1" NS_IP="10.200.1.2" RT_TABLE=200 RT_PRIO=100 NFT_TABLE="claude_vpn_nat" TICK=10
+# Считывание параметров из cld-cage
+VPN_IFACE="amn0" VPN_DNS="100.64.0.1" VPN_PROBE="1.1.1.1" CLD_TZ="Europe/Amsterdam" CLAUDE_TZ="Europe/Amsterdam"
+CAGE_REPO_DIR="" NETNS="cld_net" VETH_HOST="veth_host" VETH_NS="veth_ns"
+HOST_IP="10.200.1.1" NS_IP="10.200.1.2" RT_TABLE=200 RT_PRIO=100 NFT_TABLE="cld_cage_nat" TICK=10
 
 while IFS='=' read -r k v; do
     case "$k" in
@@ -90,7 +96,7 @@ if ip netns list 2>/dev/null | grep -qw "$NETNS"; then
     netns_active=true
     pass "Сетевое пространство (netns) '$NETNS' создано в ядре"
 else
-    fail "Сетевое пространство '$NETNS' не создано!" "Запустите: claude-vpn --up"
+    fail "Сетевое пространство '$NETNS' не создано!" "Запустите: cld-cage --up"
 fi
 
 if ip link show "$VETH_HOST" &>/dev/null; then
@@ -126,10 +132,12 @@ if [[ "$netns_active" = true ]]; then
 fi
 
 # Проверка Watchdog
-if systemctl is-active --quiet "claude-vpn-watchdog.service" 2>/dev/null; then
+if systemctl is-active --quiet "cld-cage-watchdog.service" 2>/dev/null; then
+    pass "Служба Watchdog активна (systemd: cld-cage-watchdog.service)"
+elif systemctl is-active --quiet "claude-vpn-watchdog.service" 2>/dev/null; then
     pass "Служба Watchdog активна (systemd: claude-vpn-watchdog.service)"
-elif pgrep -f "claude-vpn --watchdog-loop" &>/dev/null; then
-    pass "Фоновый Watchdog процесс активен (PID: $(pgrep -f "claude-vpn --watchdog-loop" | head -n1))"
+elif pgrep -f "cld-cage --watchdog-loop" &>/dev/null || pgrep -f "claude-vpn --watchdog-loop" &>/dev/null; then
+    pass "Фоновый Watchdog процесс активен (PID: $(pgrep -f "cld-cage --watchdog-loop|claude-vpn --watchdog-loop" | head -n1))"
 else
     warn "Watchdog демон не запущен (будет запущен при старте приложения)"
 fi
@@ -301,31 +309,31 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
     fi
 
     # 4.2. Сокрытие системных бинарников клетки
-    bin_leak=$(cvpn_exec /bin/bash -c '[ -f /usr/local/bin/claude-vpn ] && echo "LEAK" || echo "HIDDEN"' 2>/dev/null || echo "HIDDEN")
+    bin_leak=$(cvpn_exec /bin/bash -c '([ -f /usr/local/bin/cld-cage ] || [ -f /usr/local/bin/claude-vpn ]) && echo "LEAK" || echo "HIDDEN"' 2>/dev/null || echo "HIDDEN")
     bin_leak=$(echo "$bin_leak" | tail -n1)
     if [[ "$bin_leak" == "HIDDEN" ]]; then
-        pass "Бинарник /usr/local/bin/claude-vpn скрыт из файловой системы песочницы"
+        pass "Бинарники cld-cage / claude-vpn скрыты из файловой системы песочницы"
     else
-        fail "УТЕЧКА: /usr/local/bin/claude-vpn доступен внутри песочницы!"
+        fail "УТЕЧКА: Бинарники клетки доступны внутри песочницы!"
     fi
 
     # 4.3. Сокрытие конфигурационного файла
-    conf_leak=$(cvpn_exec /bin/bash -c '[ -f /etc/claude-vpn.conf ] && echo "LEAK" || echo "HIDDEN"' 2>/dev/null || echo "HIDDEN")
+    conf_leak=$(cvpn_exec /bin/bash -c '([ -f /etc/cld-cage.conf ] || [ -f /etc/claude-vpn.conf ]) && echo "LEAK" || echo "HIDDEN"' 2>/dev/null || echo "HIDDEN")
     conf_leak=$(echo "$conf_leak" | tail -n1)
     if [[ "$conf_leak" == "HIDDEN" ]]; then
-        pass "Конфиг /etc/claude-vpn.conf скрыт из файловой системы песочницы"
+        pass "Конфигурационные файлы cld-cage.conf скрыты из песочницы"
     else
-        fail "УТЕЧКА: /etc/claude-vpn.conf доступен для чтения внутри песочницы!"
+        fail "УТЕЧКА: Конфигурационный файл клетки доступен для чтения внутри песочницы!"
     fi
 
     # 4.4. Сокрытие systemd-служб клетки
-    unit_leak=$(cvpn_exec /bin/bash -c 'ls -1 /etc/systemd/system/claude-vpn* 2>/dev/null | wc -l' 2>/dev/null || echo "0")
+    unit_leak=$(cvpn_exec /bin/bash -c 'ls -1 /etc/systemd/system/cld-cage* /etc/systemd/system/claude-vpn* 2>/dev/null | wc -l' 2>/dev/null || echo "0")
     unit_leak=$(echo "$unit_leak" | tail -n1 | tr -d '[:space:]')
     unit_leak=${unit_leak:-0}
     if [[ "$unit_leak" =~ ^[0-9]+$ ]] && [[ "$unit_leak" -eq 0 ]]; then
         pass "Службы systemd клетки скрыты из /etc/systemd/system"
     else
-        fail "УТЕЧКА: Службы claude-vpn* видны в /etc/systemd/system ($unit_leak файлов)!"
+        fail "УТЕЧКА: Службы cld-cage / claude-vpn видны в /etc/systemd/system ($unit_leak файлов)!"
     fi
 
     # 4.5. Маскировка сетевых интерфейсов в /sys/class/net
@@ -438,7 +446,7 @@ if [[ -f "${REAL_HOME}/.config/fish/functions/claude-desktop.fish" ]]; then
     pass "Fish-функция 'claude-desktop' настроена"
 fi
 
-if [[ -x "${REAL_HOME}/.local/bin/claude" ]] && grep -q "claude-vpn" "${REAL_HOME}/.local/bin/claude" 2>/dev/null; then
+if [[ -x "${REAL_HOME}/.local/bin/claude" ]] && grep -q -E "cld-cage|claude-vpn" "${REAL_HOME}/.local/bin/claude" 2>/dev/null; then
     pass "Обёртка CLI ~/.local/bin/claude активна"
 else
     warn "Обёртка ~/.local/bin/claude не настроена (запустите ./install.sh)"

@@ -4,3 +4,5 @@
 .DS_Store
 *~
 ClaudeAnswer/
+__pycache__/
+*.pyc

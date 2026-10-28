@@ -62,44 +62,60 @@ fi
 
 # 3. Синтаксическая валидация скриптов перед копированием
 step "Валидация синтаксиса скриптов"
-for f in bin/claude-vpn bin/celltest bin/xdg-open-jail wrappers/claude wrappers/claude-desktop; do
-    bash -n "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
+for f in bin/cld-cage bin/celltest bin/xdg-open-jail bin/cld-probe wrappers/claude wrappers/claude-desktop; do
+    if [[ $f == *.py || $f == *probe ]]; then
+        python3 -m py_compile "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
+    else
+        bash -n "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
+    fi
 done
 info "Синтаксис всех скриптов проверен!"
 
 # 4. Установка системных бинарников
 step "Установка системного оркестратора и перехватчиков"
-sudo mkdir -p /usr/local/bin /usr/local/lib/claude-vpn
+sudo mkdir -p /usr/local/bin /usr/local/lib/cld-cage
+
+# Остановка старых служб claude-vpn (миграция на cld-cage)
+sudo systemctl stop cld-cage-watchdog.service cld-cage.service claude-vpn-watchdog.service claude-vpn.service 2>/dev/null || true
+sudo systemctl disable claude-vpn-watchdog.service claude-vpn.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/claude-vpn*.service 2>/dev/null || true
 
 # Сброс старой клетки перед обновлением
-if [[ -x /usr/local/bin/claude-vpn ]]; then
-    info "Обнаружена ранее установленная версия claude-vpn: корректная остановка старого пространства перед обновлением..."
+if [[ -x /usr/local/bin/cld-cage ]]; then
+    info "Корректный перезапуск сети cld-cage..."
+    sudo /usr/local/bin/cld-cage --down >/dev/null 2>&1 || true
+elif [[ -x /usr/local/bin/claude-vpn ]]; then
+    info "Обнаружена старая версия claude-vpn: корректная остановка перед миграцией на cld-cage..."
     sudo /usr/local/bin/claude-vpn --down >/dev/null 2>&1 || true
 fi
 
-sudo cp -f "$HERE/bin/claude-vpn" /usr/local/bin/claude-vpn
-sudo chown root:root /usr/local/bin/claude-vpn
-sudo chmod 0755 /usr/local/bin/claude-vpn
-info "Установлен /usr/local/bin/claude-vpn (root:root 0755)"
+sudo cp -f "$HERE/bin/cld-cage" /usr/local/bin/cld-cage
+sudo chown root:root /usr/local/bin/cld-cage
+sudo chmod 0755 /usr/local/bin/cld-cage
+sudo ln -sf cld-cage /usr/local/bin/claude-vpn
+info "Установлен /usr/local/bin/cld-cage (алиас: /usr/local/bin/claude-vpn)"
 
-sudo cp -f "$HERE/bin/xdg-open-jail" /usr/local/lib/claude-vpn/xdg-open-jail
-sudo chown root:root /usr/local/lib/claude-vpn/xdg-open-jail
-sudo chmod 0755 /usr/local/lib/claude-vpn/xdg-open-jail
-info "Установлен /usr/local/lib/claude-vpn/xdg-open-jail (root:root 0755)"
+sudo cp -f "$HERE/bin/xdg-open-jail" /usr/local/lib/cld-cage/xdg-open-jail
+sudo chown root:root /usr/local/lib/cld-cage/xdg-open-jail
+sudo chmod 0755 /usr/local/lib/cld-cage/xdg-open-jail
+sudo rm -rf /usr/local/lib/claude-vpn 2>/dev/null || true
+info "Установлен /usr/local/lib/cld-cage/xdg-open-jail (root:root 0755)"
 
 # 5. Настройка безопасного sudoers с visudo
 step "Настройка безопасного sudoers"
-SUDOERS_FILE="/etc/sudoers.d/claude-vpn"
+SUDOERS_FILE="/etc/sudoers.d/cld-cage"
 sudo mkdir -p /etc/sudoers.d
 
 tmp_sudoers=$(mktemp)
 cat << EOF_SUDO > "$tmp_sudoers"
-# ClaudeCage v3.0 NOPASSWD execution for claude-vpn orchestrator, celltest and claude-probe
+# ClaudeCage v3.0 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
 # !use_pty prevents TTY hijacking and LPE vulnerabilities
+Defaults!/usr/local/bin/cld-cage !use_pty
 Defaults!/usr/local/bin/claude-vpn !use_pty
 Defaults!/usr/local/bin/celltest !use_pty
+Defaults!/usr/local/bin/cld-probe !use_pty
 Defaults!/usr/local/bin/claude-probe !use_pty
-${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/bin/claude-vpn, /usr/local/bin/celltest, /usr/local/bin/claude-probe
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/bin/cld-cage, /usr/local/bin/claude-vpn, /usr/local/bin/celltest, /usr/local/bin/cld-probe, /usr/local/bin/claude-probe
 EOF_SUDO
 
 if command -v visudo &>/dev/null && ! sudo visudo -cf "$tmp_sudoers" &>/dev/null; then
@@ -111,6 +127,7 @@ fi
 sudo cp -f "$tmp_sudoers" "$SUDOERS_FILE"
 sudo chmod 0440 "$SUDOERS_FILE"
 sudo chown root:root "$SUDOERS_FILE"
+sudo rm -f /etc/sudoers.d/claude-vpn 2>/dev/null || true
 rm -f "$tmp_sudoers"
 info "Настроен $SUDOERS_FILE для пользователя $TARGET_USER"
 
@@ -124,9 +141,14 @@ for iface in amn0 wg0 tun0 proton0; do
     fi
 done
 
-SYS_CONF="/etc/claude-vpn.conf"
+SYS_CONF="/etc/cld-cage.conf"
+if [[ ! -f "$SYS_CONF" && -f "/etc/claude-vpn.conf" ]]; then
+    info "Миграция существующего конфига /etc/claude-vpn.conf в $SYS_CONF..."
+    sudo cp -f "/etc/claude-vpn.conf" "$SYS_CONF"
+fi
+
 if [[ ! -f "$SYS_CONF" ]]; then
-    sudo cp "$HERE/config/claude-vpn.conf.example" "$SYS_CONF"
+    sudo cp "$HERE/config/cld-cage.conf.example" "$SYS_CONF"
     sudo sed -i "s|VPN_IFACE=.*|VPN_IFACE=\"${DETECTED_IFACE}\"|" "$SYS_CONF"
     sudo sed -i "s|CAGE_REPO_DIR=.*|CAGE_REPO_DIR=\"${HERE}\"|" "$SYS_CONF"
     sudo chown root:root "$SYS_CONF"
@@ -144,13 +166,13 @@ fi
 
 # 7. Установка Systemd служб
 step "Установка systemd служб (Fail-Closed Kill Switch & Watchdog)"
-sudo cp -f "$HERE/systemd/claude-vpn.service" /etc/systemd/system/claude-vpn.service
-sudo cp -f "$HERE/systemd/claude-vpn-watchdog.service" /etc/systemd/system/claude-vpn-watchdog.service
+sudo cp -f "$HERE/systemd/cld-cage.service" /etc/systemd/system/cld-cage.service
+sudo cp -f "$HERE/systemd/cld-cage-watchdog.service" /etc/systemd/system/cld-cage-watchdog.service
 sudo systemctl daemon-reload
-sudo systemctl enable claude-vpn.service >/dev/null 2>&1 || true
+sudo systemctl enable cld-cage.service >/dev/null 2>&1 || true
 info "Установлены службы:"
-info "  - /etc/systemd/system/claude-vpn.service (Before=network-pre.target)"
-info "  - /etc/systemd/system/claude-vpn-watchdog.service (KillMode=control-group)"
+info "  - /etc/systemd/system/cld-cage.service (Before=network-pre.target)"
+info "  - /etc/systemd/system/cld-cage-watchdog.service (KillMode=control-group)"
 
 # 8. Установка пользовательских обёрток
 step "Установка пользовательских обёрток и интеграций"
@@ -158,7 +180,7 @@ USER_BIN="${TARGET_HOME}/.local/bin"
 mkdir -p "$USER_BIN"
 
 # Обёртка CLI claude
-if [[ -e "${USER_BIN}/claude" ]] && ! grep -q "claude-vpn" "${USER_BIN}/claude" 2>/dev/null; then
+if [[ -e "${USER_BIN}/claude" ]] && ! grep -q -E "cld-cage|claude-vpn" "${USER_BIN}/claude" 2>/dev/null; then
     info "Сохраняю оригинальный бинарник claude в claude-raw..."
     mv -f "${USER_BIN}/claude" "${USER_BIN}/claude-raw"
 fi
@@ -181,13 +203,15 @@ sudo cp -f "$HERE/bin/celltest" /usr/local/bin/celltest
 sudo chmod 0755 /usr/local/bin/celltest
 info "Установлена утилита диагностики celltest в ${USER_BIN}/celltest и /usr/local/bin/celltest"
 
-# Аудитор и логгер сетевой видимости claude-probe
-cp -f "$HERE/bin/claude-probe" "${USER_BIN}/claude-probe"
-chmod +x "${USER_BIN}/claude-probe"
-chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/claude-probe"
-sudo cp -f "$HERE/bin/claude-probe" /usr/local/bin/claude-probe
-sudo chmod 0755 /usr/local/bin/claude-probe
-info "Установлен логгер и аудитор claude-probe в ${USER_BIN}/claude-probe и /usr/local/bin/claude-probe"
+# Аудитор и логгер сетевой видимости cld-probe
+cp -f "$HERE/bin/cld-probe" "${USER_BIN}/cld-probe"
+chmod +x "${USER_BIN}/cld-probe"
+chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/cld-probe"
+ln -sf cld-probe "${USER_BIN}/claude-probe"
+sudo cp -f "$HERE/bin/cld-probe" /usr/local/bin/cld-probe
+sudo chmod 0755 /usr/local/bin/cld-probe
+sudo ln -sf cld-probe /usr/local/bin/claude-probe
+info "Установлен логгер и аудитор cld-probe в ${USER_BIN}/cld-probe и /usr/local/bin/cld-probe"
 
 # Fish функции
 if command -v fish &>/dev/null; then
@@ -195,7 +219,7 @@ if command -v fish &>/dev/null; then
     mkdir -p "$FISH_FUNC_DIR"
     cp -f "$HERE/wrappers/fish/"*.fish "$FISH_FUNC_DIR/"
     chown -R "${TARGET_USER}:${TARGET_GROUP}" "$FISH_FUNC_DIR"
-    info "Установлены fish-функции: claude, claude-desktop, claude-probe"
+    info "Установлены fish-функции: claude, claude-desktop, cld-probe"
 fi
 
 # Ярлык приложения (.desktop)
@@ -209,17 +233,18 @@ fi
 
 # 9. Запуск клетки
 step "Инициализация сетевого пространства"
-sudo /usr/local/bin/claude-vpn --up || warn "Не удалось автоматически поднять claude-vpn (проверьте статус VPN)"
+sudo /usr/local/bin/cld-cage --up || warn "Не удалось автоматически поднять cld-cage (проверьте статус VPN)"
 
 step "Итог установки"
 echo -e "${GREEN}${BOLD}Установка ClaudeCage v3.0 успешно завершена!${NC}"
 echo ""
 echo -e "Для комплексной диагностики защиты запустите:"
 echo -e "  ${CYAN}celltest${NC}        (Проверка конфигурации ядра, nftables и watchdog)"
-echo -e "  ${CYAN}claude-probe${NC}    (Аудит сетевой видимости и логгер лазеек глазами Claude)"
+echo -e "  ${CYAN}cld-probe${NC}       (Аудит сетевой видимости и логгер лазеек глазами Claude)"
 echo ""
 echo -e "Для живого мониторинга соединений клетки в реальном времени:"
-echo -e "  ${CYAN}claude-probe --monitor${NC}"
+echo -e "  ${CYAN}cld-probe --monitor${NC}"
+echo "  (или cld-cage --monitor)"
 echo ""
 echo -e "Для запуска Claude в изолированной невидимой песочнице:"
 echo -e "  ${CYAN}claude${NC}          (CLI версия)"

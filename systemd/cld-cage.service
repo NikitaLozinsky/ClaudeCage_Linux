@@ -10,8 +10,8 @@ Before=shutdown.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/claude-vpn --up
-ExecStop=/usr/local/bin/claude-vpn --down
+ExecStart=/usr/local/bin/cld-cage --up
+ExecStop=/usr/local/bin/cld-cage --down
 
 [Install]
 WantedBy=multi-user.target sysinit.target

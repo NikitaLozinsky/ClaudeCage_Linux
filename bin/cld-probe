@@ -252,11 +252,11 @@ def probe_stealth():
         "hostname": socket.gethostname(),
         "cage_repo_dir_exists": os.path.exists(cage_dir),
         "cage_repo_files_count": cage_files_count,
-        "bin_claude_vpn_visible": os.path.exists("/usr/local/bin/claude-vpn"),
+        "bin_cld_cage_visible": os.path.exists("/usr/local/bin/cld-cage") or os.path.exists("/usr/local/bin/claude-vpn"),
         "bin_celltest_visible": os.path.exists("/usr/local/bin/celltest"),
-        "bin_claude_probe_visible": os.path.exists("/usr/local/bin/claude-probe"),
-        "conf_claude_vpn_visible": os.path.exists("/etc/claude-vpn.conf"),
-        "systemd_unit_visible": os.path.exists("/etc/systemd/system/claude-vpn.service")
+        "bin_cld_probe_visible": os.path.exists("/usr/local/bin/cld-probe") or os.path.exists("/usr/local/bin/claude-probe"),
+        "conf_cld_cage_visible": os.path.exists("/etc/cld-cage.conf") or os.path.exists("/etc/claude-vpn.conf"),
+        "systemd_unit_visible": os.path.exists("/etc/systemd/system/cld-cage.service") or os.path.exists("/etc/systemd/system/claude-vpn.service")
     }
 
 data = {
@@ -301,7 +301,7 @@ class ClaudeProbe:
             home = os.environ.get("HOME", f"/home/{user}")
 
         state_base = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
-        self.log_dir = custom_log_dir or os.path.join(state_base, "claude-vpn")
+        self.log_dir = custom_log_dir or os.path.join(state_base, "cld-cage")
         os.makedirs(self.log_dir, exist_ok=True)
 
     def color(self, code: str, text: str) -> str:
@@ -360,8 +360,11 @@ class ClaudeProbe:
 
     # ── 2. Выполнение внутриклеточного сканирования ───────────────────────
     def run_cage_probe(self) -> bool:
-        """Запускает скрипт тестирования внутри клетки через claude-vpn."""
-        cmd = ["sudo", "/usr/local/bin/claude-vpn", "python3", "-c", CAGE_PROBE_SCRIPT]
+        """Запускает скрипт тестирования внутри клетки через cld-cage."""
+        cvpn = "/usr/local/bin/cld-cage"
+        if not os.path.exists(cvpn):
+            cvpn = "/usr/local/bin/claude-vpn"
+        cmd = ["sudo", cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
         try:
             # Запускаем в нейтральном каталоге /tmp, чтобы не вызвать сработку защиты директории
             proc = subprocess.run(
@@ -581,7 +584,7 @@ class ClaudeProbe:
         # ── Вектор 8: Сокрытие файлов клетки от ИИ-агента
         cage_exists = st.get("cage_repo_dir_exists", False)
         cage_files = st.get("cage_repo_files_count", -1)
-        vpn_bin = st.get("bin_claude_vpn_visible", False)
+        cage_bin = st.get("bin_cld_cage_visible", False) or st.get("bin_claude_vpn_visible", False)
         celltest_bin = st.get("bin_celltest_visible", False)
         systemd_vis = st.get("systemd_unit_visible", False)
 
@@ -592,9 +595,9 @@ class ClaudeProbe:
             stealth_desc = f"УТЕЧКА: ИИ-агент может прочитать {cage_files} файлов репозитория ClaudeCage!"
             self.score -= 30
             self.vulnerabilities += 1
-        elif vpn_bin or celltest_bin or systemd_vis:
+        elif cage_bin or celltest_bin or systemd_vis:
             stealth_status = "WARN"
-            stealth_desc = f"Внимание: Часть служебных бинарников видна в оверлее ФС (vpn={vpn_bin})"
+            stealth_desc = f"Внимание: Часть служебных бинарников видна в оверлее ФС (cage={cage_bin})"
             self.score -= 10
             self.warnings += 1
 
@@ -729,13 +732,16 @@ class ClaudeProbe:
 # ==============================================================================
 def run_live_monitor(log_dir: str):
     """Мониторинг сетевых соединений из клетки в реальном времени."""
-    print(f"{C_PURPLE + C_BOLD}=== CLAUDE-PROBE: Живой Мониторинг Трафика Клетки ==={C_RESET}")
-    print(f"Отслеживание соединений из пространства claude_vpn...")
+    print(f"{C_PURPLE + C_BOLD}=== CLD-PROBE: Живой Мониторинг Трафика Клетки ==={C_RESET}")
+    print(f"Отслеживание соединений из защищенного пространства...")
     print(f"Для выхода нажмите Ctrl+C\n")
 
     log_file = os.path.join(log_dir, f"traffic_{datetime.date.today().strftime('%Y-%m-%d')}.log")
 
-    cmd = ["sudo", "/usr/local/bin/claude-vpn", "--monitor"]
+    cvpn = "/usr/local/bin/cld-cage"
+    if not os.path.exists(cvpn):
+        cvpn = "/usr/local/bin/claude-vpn"
+    cmd = ["sudo", cvpn, "--monitor"]
     try:
         proc = subprocess.Popen(cmd)
         proc.wait()
@@ -753,11 +759,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
-  claude-probe               # Полный комплексный аудит сети и лазеек
-  claude-probe --monitor     # Живой мониторинг сетевых соединений в реальном времени
-  claude-probe --cli         # Проверка профиля CLI (Node.js/bash)
-  claude-probe --desktop     # Проверка профиля Desktop (Electron/WebRTC)
-  claude-probe --json        # Вывод результатов в формате JSON
+  cld-probe                  # Полный комплексный аудит сети и лазеек
+  cld-probe --monitor        # Живой мониторинг сетевых соединений в реальном времени
+  cld-probe --cli            # Проверка профиля CLI (Node.js/bash)
+  cld-probe --desktop        # Проверка профиля Desktop (Electron/WebRTC)
+  cld-probe --json           # Вывод результатов в формате JSON
         """
     )
     parser.add_argument("--audit", action="store_true", default=True, help="Запустить комплексный аудит (по умолчанию)")
