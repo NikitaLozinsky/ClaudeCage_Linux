@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# celltest v3.0 — Комплексный аудит эшелонированной защиты и невидимости ClaudeCage
+# celltest v3.1 — Комплексный аудит эшелонированной защиты и невидимости ClaudeCage
 # Проверяет ядро, kill switch, нулевую утечку РФ/IP и сокрытие клетки от ИИ-агента
 # ==============================================================================
 set -uo pipefail
@@ -85,7 +85,7 @@ skip() { ((SKIPS++)); echo -e "  ${YELLOW}○${NC} Пропущено: $1"; }
 header() { echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}"; }
 
 echo -e "${BOLD}${PURPLE}╔══════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${PURPLE}║       CELLTEST v3.0: Комплексный аудит защиты и невидимости      ║${NC}"
+echo -e "${BOLD}${PURPLE}║       CELLTEST v3.1: Комплексный аудит защиты и невидимости      ║${NC}"
 echo -e "${BOLD}${PURPLE}╚══════════════════════════════════════════════════════════════════╝${NC}"
 
 # ── 1. ЯДРО И СЕТЕВОЙ NAMESPACE (NETNS) ─────────────────────────
@@ -201,6 +201,21 @@ if nft list table inet "$NFT_TABLE" &>/dev/null; then
         pass "Динамический MSS Clamping активен (tcp option maxseg size set rt mtu)"
     else
         warn "Правило MSS Clamping не найдено"
+    fi
+
+    # Блокировка RFC1918 в prerouting_filter (ДО таблицы lookup local)
+    if nft list chain inet "$NFT_TABLE" prerouting_filter 2>/dev/null | grep -qE "192.168.0.0/16.*drop"; then
+        pass "Фильтр RFC1918 активен в prerouting_filter (блокировка ДО lookup local)"
+    else
+        fail "Цепочка prerouting_filter не блокирует подсети RFC1918!"
+    fi
+
+    # Блокировка QUIC (UDP 443) и DoT (853)
+    if nft list chain inet "$NFT_TABLE" forward 2>/dev/null | grep -qE "dport 443 reject" &&
+       nft list chain inet "$NFT_TABLE" forward 2>/dev/null | grep -qE "dport 853 reject"; then
+        pass "Блокировка QUIC (UDP 443) и DoT (853) активна (принудительный откат на TCP/DNS)"
+    else
+        fail "Правила отклонения QUIC/DoT в цепочке forward отсутствуют!"
     fi
 
     # Input isolation
@@ -336,11 +351,11 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "УТЕЧКА: Службы cld-cage / claude-vpn видны в /etc/systemd/system ($unit_leak файлов)!"
     fi
 
-    # 4.5. Маскировка сетевых интерфейсов в /sys/class/net
+    # 4.5. Маскировка сетевых интерфейсов в /sys/class/net (мимикрия физического адаптера enp3s0)
     sys_links=$(cvpn_exec /bin/bash -c 'ls -1 /sys/class/net 2>/dev/null | sort | tr "\n" " "' 2>/dev/null || echo "")
     trimmed_links=$(echo "$sys_links" | xargs)
-    if [[ "$trimmed_links" == "lo veth_ns" || "$trimmed_links" == "veth_ns lo" ]]; then
-        pass "/sys/class/net содержит строго 'lo' и 'veth_ns' (все физические интерфейсы хоста скрыты)"
+    if [[ "$trimmed_links" == "enp3s0 lo" || "$trimmed_links" == "lo enp3s0" || "$trimmed_links" == "lo veth_ns" ]]; then
+        pass "/sys/class/net содержит строго 'lo' и 'enp3s0' (физический Ethernet-адаптер)"
     else
         warn "/sys/class/net содержит посторонние интерфейсы: '$sys_links' (проверьте сокрытие)"
     fi
@@ -371,6 +386,60 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         pass "Хостовая сессионная шина D-Bus (/run/user/UID/bus) замаскирована"
     else
         fail "УТЕЧКА D-BUS: Сессионная шина хоста доступна из клетки!"
+    fi
+
+    # 4.9. Изоляция /proc/1/net/dev и /proc/1/net/arp (PID Namespace)
+    proc_dev_leak=$(cvpn_exec /bin/bash -c 'grep -E "wlan|amn" /proc/1/net/dev 2>/dev/null || true')
+    if [[ -z "$proc_dev_leak" ]]; then
+        pass "Изоляция /proc/1/net/dev: сетевые интерфейсы хоста (wlan0, amn0) скрыты"
+    else
+        fail "УТЕЧКА: /proc/1/net/dev содержит интерфейсы хоста: $proc_dev_leak"
+    fi
+
+    # 4.10. Изоляция /proc/*/environ (ru_RU)
+    proc_env_leak=$(cvpn_exec /bin/bash -c 'grep -rn "ru_RU" /proc/[0-9]*/environ 2>/dev/null | wc -l || echo 0')
+    proc_env_leak=$(echo "$proc_env_leak" | tail -n1 | tr -d '[:space:]')
+    if [[ "$proc_env_leak" -eq 0 ]]; then
+        pass "Изоляция /proc/*/environ: утечек русской локали хоста нет (0 совпадений ru_RU)"
+    else
+        fail "УТЕЧКА: /proc/*/environ содержит русскую локаль хоста ($proc_env_leak совпадений)!"
+    fi
+
+    # 4.11. Спуфинг /etc/machine-id
+    host_mid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || echo "")
+    cage_mid=$(cvpn_exec /bin/bash -c 'cat /etc/machine-id 2>/dev/null || echo ""')
+    cage_mid=$(echo "$cage_mid" | tail -n1 | tr -d '[:space:]')
+    if [[ -n "$cage_mid" && ${#cage_mid} -eq 32 && "$cage_mid" != "$host_mid" ]]; then
+        pass "Спуфинг /etc/machine-id: уникальный ID клетки ($cage_mid, изолирован от хоста)"
+    elif [[ "$cage_mid" == "$host_mid" && -n "$host_mid" ]]; then
+        fail "УТЕЧКА: /etc/machine-id в клетке совпадает с реальным ID хоста!"
+    else
+        warn "/etc/machine-id в клетке: '$cage_mid' (длина: ${#cage_mid})"
+    fi
+
+    # 4.12. Чистота /proc/self/mountinfo
+    mount_leak=$(cvpn_exec /bin/bash -c 'grep "/etc/netns/cld_net" /proc/self/mountinfo 2>/dev/null || true')
+    if [[ -z "$mount_leak" ]]; then
+        pass "Чистота /proc/self/mountinfo: пути /etc/netns/cld_net отсутствуют"
+    else
+        fail "УТЕЧКА: В /proc/self/mountinfo обнаружен путь netns: $mount_leak"
+    fi
+
+    # 4.13. Маскировка беспроводных подсистем ядра в /sys
+    wifi_leak=$(cvpn_exec /bin/bash -c 'ls -A /sys/class/ieee80211 2>/dev/null | wc -l')
+    wifi_leak=$(echo "$wifi_leak" | tail -n1 | tr -d '[:space:]')
+    if [[ "$wifi_leak" -eq 0 ]]; then
+        pass "Беспроводные подсистемы /sys/class/ieee80211 замаскированы (0 утечек Wi-Fi)"
+    else
+        fail "УТЕЧКА: В /sys/class/ieee80211 видны устройства Wi-Fi ($wifi_leak шт.)!"
+    fi
+
+    # 4.14. Мимикрия аппаратного MAC-адреса (Intel OUI ac:1f:6b)
+    cage_mac=$(ip netns exec "$NETNS" cat /sys/class/net/"$VETH_NS"/address 2>/dev/null || true)
+    if [[ "$cage_mac" =~ ^ac:1f:6b:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$ ]]; then
+        pass "Аппаратный MAC интерфейса $VETH_NS: $cage_mac (Intel OUI ac:1f:6b)"
+    else
+        warn "MAC-адрес $VETH_NS: '$cage_mac' (ожидался вендор Intel ac:1f:6b:...)"
     fi
 else
     skip "Тесты сокрытия пропущены (--no-app или netns не активен)"

@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-CLAUDE-PROBE v1.0 — Network Visibility & Threat Audit Logger for ClaudeCage
+CLAUDE-PROBE v1.1 — Network Visibility & Threat Audit Logger for ClaudeCage
 Аудитор и логгер: проверяет, как Claude (CLI и Desktop) видит сеть,
 какие возможности узнать реальный IP и какие лазейки ему доступны.
 ==============================================================================
@@ -22,7 +22,7 @@ import time
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0-stealth"
+VERSION = "1.1-stealth"
 
 # ANSI Цвета оформления
 C_RED = "\033[0;31m"
@@ -174,6 +174,89 @@ def probe_host_scan():
             s.close()
     return results
 
+def probe_rfc1918_scan():
+    targets = ["192.168.0.40", "192.168.1.1", "172.16.0.1", "10.0.0.1"]
+    res = {}
+    for ip in targets:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            s.connect((ip, 80))
+            res[ip] = "OPEN"
+        except socket.timeout:
+            res[ip] = "DROPPED (Timeout)"
+        except ConnectionRefusedError:
+            res[ip] = "REFUSED (RST)"
+        except OSError as e:
+            res[ip] = f"BLOCKED ({type(e).__name__})"
+        except Exception as e:
+            res[ip] = f"ERR: {type(e).__name__}"
+        finally:
+            s.close()
+    return res
+
+def probe_proc_isolation():
+    devs = []
+    try:
+        if os.path.exists("/proc/1/net/dev"):
+            with open("/proc/1/net/dev") as f:
+                for line in f.readlines()[2:]:
+                    parts = line.split(":")
+                    if parts:
+                        devs.append(parts[0].strip())
+    except Exception as e:
+        devs.append(f"err: {e}")
+
+    arp_entries = []
+    try:
+        if os.path.exists("/proc/1/net/arp"):
+            with open("/proc/1/net/arp") as f:
+                arp_entries = [line.strip() for line in f.readlines()[1:] if line.strip()]
+    except Exception as e:
+        arp_entries.append(f"err: {e}")
+
+    ru_in_environ = False
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+        for p in pids:
+            env_file = os.path.join("/proc", p, "environ")
+            if os.path.exists(env_file):
+                try:
+                    with open(env_file, "rb") as ef:
+                        if b"ru_RU" in ef.read():
+                            ru_in_environ = True
+                            break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    mountinfo_has_cld_net = False
+    try:
+        if os.path.exists("/proc/self/mountinfo"):
+            with open("/proc/self/mountinfo") as f:
+                content = f.read()
+                if "/etc/netns/cld_net" in content:
+                    mountinfo_has_cld_net = True
+    except Exception:
+        pass
+
+    mid = ""
+    try:
+        if os.path.exists("/etc/machine-id"):
+            with open("/etc/machine-id") as f:
+                mid = f.read().strip()
+    except Exception:
+        pass
+
+    return {
+        "proc_1_net_dev": devs,
+        "proc_1_net_arp": arp_entries,
+        "ru_in_environ": ru_in_environ,
+        "mountinfo_has_cld_net": mountinfo_has_cld_net,
+        "machine_id": mid
+    }
+
 def probe_dns():
     res = {}
     try:
@@ -269,9 +352,11 @@ data = {
     "stun_google": probe_stun("stun.l.google.com", 19302),
     "stun_cloudflare": probe_stun("stun.cloudflare.com", 3478),
     "host_scan": probe_host_scan(),
+    "rfc1918_scan": probe_rfc1918_scan(),
     "dns": probe_dns(),
     "dbus": probe_dbus(),
-    "stealth": probe_stealth()
+    "stealth": probe_stealth(),
+    "proc_isolation": probe_proc_isolation()
 }
 
 print(json.dumps(data))
@@ -355,6 +440,16 @@ class ClaudeProbe:
                 pass
         baseline["real_locale"] = loc
         baseline["hostname"] = socket.gethostname()
+
+        # Machine ID хоста
+        mid = "unknown"
+        if os.path.exists("/etc/machine-id"):
+            try:
+                with open("/etc/machine-id") as f:
+                    mid = f.read().strip()
+            except Exception:
+                pass
+        baseline["real_machine_id"] = mid
 
         self.host_baseline = baseline
 
@@ -462,16 +557,22 @@ class ClaudeProbe:
         cage_ifaces = list(cr.get("interfaces", {}).keys())
         cage_sys_net = cr.get("sys_class_net", [])
         cage_node_ifaces = list(cr.get("node_interfaces", {}).keys())
+        proc_devs = cr.get("proc_isolation", {}).get("proc_1_net_dev", [])
 
         iface_status = "SAFE"
         exposed_phys = []
-        for ifc in cage_ifaces + cage_sys_net + cage_node_ifaces:
-            if re.match(r'^(wlan|eth|enp|wlp|wls|ens|ppp|tun|wg|docker|br-)', ifc):
+        for ifc in cage_ifaces + cage_sys_net + cage_node_ifaces + proc_devs:
+            if ifc in ("lo", "enp3s0", "veth_ns"):
+                continue
+            if re.match(r'^(wlan|eth|wlp|wls|ens|ppp|tun|wg|docker|br-|amn)', ifc) or (ifc.startswith("enp") and ifc != "enp3s0"):
                 exposed_phys.append(ifc)
 
         exposed_macs = []
-        for ifc_data in cr.get("interfaces", {}).values():
+        enp_mac = ""
+        for ifc_name, ifc_data in cr.get("interfaces", {}).items():
             mac = ifc_data.get("mac", "")
+            if ifc_name == "enp3s0":
+                enp_mac = mac
             if mac in hb.get("real_macs", []):
                 exposed_macs.append(mac)
 
@@ -480,6 +581,10 @@ class ClaudeProbe:
             iface_desc = f"Утечка физических адаптеров хоста: {set(exposed_phys)}, MAC: {set(exposed_macs)}"
             self.score -= 40
             self.vulnerabilities += 1
+        elif "enp3s0" in cage_ifaces:
+            is_intel = enp_mac.lower().startswith("ac:1f:6b:")
+            intel_info = "Intel OUI ac:1f:6b" if is_intel else f"MAC: {enp_mac}"
+            iface_desc = f"Мимикрия: физический enp3s0 ({intel_info}), MAC хоста скрыты"
         else:
             iface_desc = f"Только виртуальные: {', '.join(set(cage_ifaces))} (MAC железа скрыты)"
 
@@ -492,18 +597,20 @@ class ClaudeProbe:
 
         # ── Вектор 4: Попытка доступа к хосту и портам LAN (Lateral Movement)
         host_scan = cr.get("host_scan", {})
+        rfc_scan = cr.get("rfc1918_scan", {})
         open_ports = [p for p, res in host_scan.items() if res == "OPEN"]
         # Порт 53 перенаправлен через DNAT на VPN DNS — это легитимно
         suspicious_open = [p for p in open_ports if p != "53"]
+        rfc_leaks = [ip for ip, res in rfc_scan.items() if res == "OPEN"]
 
         scan_status = "SAFE"
-        if suspicious_open:
+        if suspicious_open or rfc_leaks:
             scan_status = "LEAK"
-            scan_desc = f"УЯЗВИМОСТЬ: Открыты порты хоста для Claude: {', '.join(suspicious_open)}"
+            scan_desc = f"УЯЗВИМОСТЬ: Доступны сервисы хоста/LAN: {suspicious_open + rfc_leaks}"
             self.score -= 30
             self.vulnerabilities += 1
         else:
-            scan_desc = "Все порты хоста (SSH, Web, Dev, DB) заблокированы (Timeout / nft drop)"
+            scan_desc = "Все порты хоста и подсети RFC1918 заблокированы (raw drop / Timeout)"
 
         v.append({
             "vector": "4. Сканирование хоста (LAN/SSH)",
@@ -573,6 +680,11 @@ class ClaudeProbe:
             fraud_desc += " [КРИТИЧЕСКАЯ УТЕЧКА: Локаль указывает на ru_RU!]"
             self.score -= 40
             self.vulnerabilities += 1
+        elif cr.get("proc_isolation", {}).get("ru_in_environ"):
+            fraud_status = "LEAK"
+            fraud_desc += " [КРИТИЧЕСКАЯ УТЕЧКА: Найдена локаль ru_RU в /proc/*/environ!]"
+            self.score -= 40
+            self.vulnerabilities += 1
 
         v.append({
             "vector": "7. Геолокация, Таймзона и Локаль",
@@ -587,9 +699,13 @@ class ClaudeProbe:
         cage_bin = st.get("bin_cld_cage_visible", False) or st.get("bin_claude_vpn_visible", False)
         celltest_bin = st.get("bin_celltest_visible", False)
         systemd_vis = st.get("systemd_unit_visible", False)
+        proc_iso = cr.get("proc_isolation", {})
+        has_cld_net_mount = proc_iso.get("mountinfo_has_cld_net", False)
+        cage_mid = proc_iso.get("machine_id", "")
+        real_mid = hb.get("real_machine_id", "")
 
         stealth_status = "SAFE"
-        stealth_desc = f"Каталог ClaudeCage: пустой tmpfs ({cage_files} файлов); Бинарники клетки удалены из оверлея"
+        stealth_desc = f"Репозиторий скрыт ({cage_files} файлов); mountinfo чист; machine-id изолирован"
         if cage_files > 0:
             stealth_status = "LEAK"
             stealth_desc = f"УТЕЧКА: ИИ-агент может прочитать {cage_files} файлов репозитория ClaudeCage!"
@@ -600,6 +716,16 @@ class ClaudeProbe:
             stealth_desc = f"Внимание: Часть служебных бинарников видна в оверлее ФС (cage={cage_bin})"
             self.score -= 10
             self.warnings += 1
+        elif has_cld_net_mount:
+            stealth_status = "WARN"
+            stealth_desc = "Внимание: /etc/netns/cld_net виден в /proc/self/mountinfo!"
+            self.score -= 10
+            self.warnings += 1
+        elif cage_mid and real_mid and cage_mid == real_mid:
+            stealth_status = "LEAK"
+            stealth_desc = "УТЕЧКА: machine-id в клетке совпадает с реальным machine-id хоста!"
+            self.score -= 20
+            self.vulnerabilities += 1
 
         v.append({
             "vector": "8. Сокрытие факта клетки от Claude",
@@ -662,7 +788,7 @@ class ClaudeProbe:
             f"(Страна: {cr.get('egress', {}).get('cloudflare', {}).get('country', '??')}, Colo: {cr.get('egress', {}).get('cloudflare', {}).get('colo', '??')})")
         out(f"  • STUN WebRTC IP:      {cr.get('stun_google', {}).get('ip', 'N/A')}")
         out(f"  • Интерфейсы хоста:    {len(hb.get('interfaces', []))} шт. (wlan0, eth0 и др.)")
-        out(f"  • Интерфейсы в клетке: {', '.join(list(cr.get('interfaces', {}).keys()))} (только виртуальные veth_ns, lo)")
+        out(f"  • Интерфейсы в клетке: {', '.join(list(cr.get('interfaces', {}).keys()))} (мимикрия физического адаптера enp3s0)")
         out(f"  • Таймзона хоста:      {hb.get('real_localtime')}")
         out(f"  • Таймзона в клетке:   {st.get('node_timezone')} (симлинк: {st.get('localtime_symlink')})")
         out(f"  • Доступ к хосту (SSH):{cr.get('host_scan', {}).get('22', 'UNKNOWN')}")

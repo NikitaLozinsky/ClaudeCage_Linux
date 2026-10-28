@@ -1,18 +1,18 @@
-# 🛡️ ClaudeCage v3.0 (Linux)
+# 🛡️ ClaudeCage v3.1 (Linux)
 
 > **Многоуровневая эшелонированная оборона на уровне ядра Linux для Claude Code (CLI) и Claude Desktop (Electron). 100% защита от антифрода Anthropic, аппаратный Kill Switch, нулевая утечка реального IP, DNS, WebRTC, региональных признаков (РФ/Europe/Moscow) и полная скрытность клетки от ИИ-агента.**
 
 [![Platform](https://img.shields.io/badge/Platform-Linux%20(Arch%20%7C%20Debian%20%7C%20Fedora%20%7C%20Ubuntu)-blue.svg?logo=linux)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![Security](https://img.shields.io/badge/Security-Hardened%20Kill%20Switch-success.svg?logo=securityscorecard)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
-[![Stealth](https://img.shields.io/badge/Stealth-Cage%20Concealment%20%2B%20Zero--Leak-orange.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
-[![Diagnostics](https://img.shields.io/badge/Diagnostics-celltest%20v3.0%20PASS-brightgreen.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
+[![Stealth](https://img.shields.io/badge/Stealth-Deep%20Stealth%20%2B%20Kernel%20Hardening-orange.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
+[![Diagnostics](https://img.shields.io/badge/Diagnostics-celltest%20v3.1%2046%2F46%20PASS-brightgreen.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
 
-## 🚀 1. Как устроен ClaudeCage v3.0 и почему это круто
+## 🚀 1. Как устроен ClaudeCage v3.1 и почему это круто
 
-Внутри **ClaudeCage v3.0** реализована многоуровневая эшелонированная оборона и невидимая песочница на уровне ядра операционной системы Linux. Все процессы Claude изолируются в отдельном сетевом пространстве (`ip netns`), запускаются внутри песочницы монтирования (`bubblewrap`) с собственной шиной D-Bus и оверлеем `/etc`, а трафик фильтруется аппаратным брандмауэром `nftables`:
+Внутри **ClaudeCage v3.1** реализована многоуровневая эшелонированная оборона и невидимая песочница на уровне ядра операционной системы Linux. Все процессы Claude изолируются в отдельном сетевом пространстве (`ip netns`), запускаются внутри песочницы монтирования (`bubblewrap`) с изолированным PID-пространством (`--unshare-pid --proc /proc`), собственной шиной D-Bus и оверлеем `/etc`, а трафик фильтруется аппаратным брандмауэром `nftables`:
 
 ```mermaid
 flowchart TD
@@ -21,12 +21,14 @@ flowchart TD
     end
 
     subgraph Stealth["🕵️ Стелс-слой и Защита от Деанонимизации"]
+        PID_HIDE["🔒 PID Namespace (--unshare-pid --proc /proc, сокрытие /proc/1/net/dev)"]
         HIDE["📁 Сокрытие артефактов клетки (репозиторий ClaudeCage и бинарники)"]
-        NET_HIDE["🔌 Маскировка /sys/class/net (только lo и veth_ns, скрыты wlan/eth/MAC)"]
-        TZ_SPOOF["🕒 Подмена /etc/localtime (симлинк на таймзону VPN)"]
+        NET_HIDE["🔌 Мимикрия адаптера enp3s0 (Intel OUI ac:1f:6b, скрыты wlan/eth/MAC)"]
+        TZ_SPOOF["🕒 Подмена /etc/localtime и machine-id (отличие от хоста)"]
         LOC_SPOOF["🌐 Спуфинг /etc/locale.conf и env (en_US.UTF-8, очистка ru_RU)"]
         HOST_KEEP["💻 Естественный Hostname хоста (отсутствие suspicious маркеров 'jail')"]
 
+        PID_HIDE --> HIDE
         HIDE -->|"Маскировка устройств"| NET_HIDE
         HIDE -->|"Оверлей /etc"| TZ_SPOOF
         TZ_SPOOF -->|"Синхронизация региона"| LOC_SPOOF
@@ -38,8 +40,9 @@ flowchart TD
         BWRAP["📦 Песочница bwrap (--overlay-src /etc, маскировка /run/dbus и systemd --user)"]
         TTY_FIX["⌨️ Честный TTY для CLI (полная поддержка Ctrl+C и SIGINT без --new-session)"]
         DBUS["🔒 Изолированная шина D-Bus (dbus-run-session + xdg-open-jail)"]
-        NETNS["🌐 Сетевой стек ядра (ip netns cld_net + veth 10.200.1.0/24)"]
-        NFT["🧱 24/7 Аппаратный Kill Switch nftables (Drop выше ct established)"]
+        NETNS["🌐 Сетевой стек ядра (ip netns cld_net + enp3s0 10.200.1.0/24)"]
+        NFT_RAW["🧱 nftables prerouting_filter (Drop RFC1918 10/8, 172.16/12, 192.168/16 до routing)"]
+        NFT["🧱 24/7 Аппаратный Kill Switch nftables (Drop выше ct established, Reject QUIC/DoT)"]
         DNAT["📋 Принудительный DNAT DNS (Порт 53 -> Резолвер VPN)"]
         WD["👁️ Systemd Watchdog Демон (Netlink мониторинг + авто-лечение + сброс сокетов ss -K)"]
     end

@@ -1,5 +1,6 @@
-# ClaudeCage v3.0 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
-# !use_pty prevents TTY hijacking and LPE vulnerabilities
+# ClaudeCage v3.1 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
+# Defaults env_reset and !use_pty prevent environment injection, TTY hijacking and LPE vulnerabilities
+Defaults env_reset
 Defaults!/usr/local/bin/cld-cage !use_pty
 Defaults!/usr/local/bin/claude-vpn !use_pty
 Defaults!/usr/local/bin/celltest !use_pty

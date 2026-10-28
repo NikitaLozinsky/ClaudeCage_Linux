@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# ClaudeCage Installer (Linux) v3.0 Stealth
+# ClaudeCage Installer (Linux) v3.1 Stealth
 # Automated deployment of kernel-level netns, nftables kill switch, systemd units
 # zero-leak geo spoofing and stealth wrappers
 # ==============================================================================
@@ -17,7 +17,7 @@ step()  { echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}"; }
 
 echo -e "${BOLD}${CYAN}"
 echo "╔══════════════════════════════════════════════════════════════════╗"
-echo "║      ClaudeCage v3.0: Linux Network Sandbox & Stealth Jail       ║"
+echo "║      ClaudeCage v3.1: Linux Network Sandbox & Stealth Jail       ║"
 echo "╚══════════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -108,8 +108,9 @@ sudo mkdir -p /etc/sudoers.d
 
 tmp_sudoers=$(mktemp)
 cat << EOF_SUDO > "$tmp_sudoers"
-# ClaudeCage v3.0 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
-# !use_pty prevents TTY hijacking and LPE vulnerabilities
+# ClaudeCage v3.1 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
+# Defaults env_reset and !use_pty prevent environment injection, TTY hijacking and LPE vulnerabilities
+Defaults env_reset
 Defaults!/usr/local/bin/cld-cage !use_pty
 Defaults!/usr/local/bin/claude-vpn !use_pty
 Defaults!/usr/local/bin/celltest !use_pty
@@ -236,7 +237,7 @@ step "Инициализация сетевого пространства"
 sudo /usr/local/bin/cld-cage --up || warn "Не удалось автоматически поднять cld-cage (проверьте статус VPN)"
 
 step "Итог установки"
-echo -e "${GREEN}${BOLD}Установка ClaudeCage v3.0 успешно завершена!${NC}"
+echo -e "${GREEN}${BOLD}Установка ClaudeCage v3.1 успешно завершена!${NC}"
 echo ""
 echo -e "Для комплексной диагностики защиты запустите:"
 echo -e "  ${CYAN}celltest${NC}        (Проверка конфигурации ядра, nftables и watchdog)"

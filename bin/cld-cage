@@ -14,10 +14,10 @@
 # ==============================================================================
 set -uo pipefail
 
-readonly VERSION="3.0-stealth"
+readonly VERSION="3.1-stealth"
 readonly NETNS="cld_net"
 readonly VETH_HOST="veth_host"
-readonly VETH_NS="veth_ns"
+readonly VETH_NS="enp3s0"
 readonly SUBNET="10.200.1"
 readonly HOST_IP="${SUBNET}.1"
 readonly NS_IP="${SUBNET}.2"
@@ -43,6 +43,19 @@ VPN_PROBE="1.1.1.1"
 CLAUDE_TZ="Europe/Amsterdam"
 CLD_TZ="Europe/Amsterdam"
 CAGE_REPO_DIR=""
+CAGE_MACHINE_ID=""
+
+ensure_cage_machine_id() {
+    local f="/etc/cld-cage.machine-id"
+    if [[ ! -s $f ]]; then
+        local host_mid
+        host_mid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || echo "$RANDOM$RANDOM")
+        printf '%s-cld-stealth' "$host_mid" | sha256sum | awk '{print substr($1,1,32)}' > "$f" 2>/dev/null || true
+        chmod 0644 "$f" 2>/dev/null || true
+    fi
+    CAGE_MACHINE_ID=$(cat "$f" 2>/dev/null | tr -d '[:space:]')
+    [[ -n $CAGE_MACHINE_ID ]] || CAGE_MACHINE_ID="c1dc9e00000000000000000000000001"
+}
 
 readonly IFACE_RE='^[A-Za-z0-9_.-]{1,15}$'
 readonly OCT='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
@@ -148,6 +161,17 @@ nft_rules() {
 table inet ${NFT_TABLE}
 delete table inet ${NFT_TABLE}
 table inet ${NFT_TABLE} {
+    chain prerouting_filter {
+        type filter hook prerouting priority raw; policy accept;
+        meta nfproto ipv6 iifname "${VETH_HOST}" drop
+
+        # Разрешить трафик к шлюзу клетки (10.200.1.1) и DNS VPN
+        iifname "${VETH_HOST}" ip daddr ${HOST_IP} accept
+        iifname "${VETH_HOST}" ip daddr ${VPN_DNS} accept
+
+        # Блокировать любые обращения к локальным сетям RFC1918 и Link-Local ДО таблицы lookup local!
+        iifname "${VETH_HOST}" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop
+    }
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
         # Перехват любого DNS (порт 53 UDP/TCP) из клетки на изолированный резолвер VPN
@@ -168,6 +192,10 @@ table inet ${NFT_TABLE} {
         # Защита от спуфинга IP внутри клетки
         iifname "${VETH_HOST}" ip saddr != ${NS_IP} counter drop
         iifname "${VETH_HOST}" ct state invalid counter drop
+
+        # Блокировка DoT (853) и QUIC (UDP 443) для исключения обхода DNS и проблем с PMTUD
+        iifname "${VETH_HOST}" meta l4proto { tcp, udp } th dport 853 reject
+        iifname "${VETH_HOST}" meta l4proto udp th dport 443 reject
 
         # АППАРАТНЫЙ KILL SWITCH: всё из клетки мимо туннеля сбрасывается (выше conntrack!)
         iifname "${VETH_HOST}" oifname != "${VPN_IFACE}" counter drop
@@ -215,6 +243,7 @@ host_hooks_up() {
 # ── Netns & Virtual Ethernet ─────────────────────────────────────
 ensure_netns() {
     local mtu k; mtu=$(get_vpn_mtu)
+    ensure_cage_machine_id
     netns_exists || ip netns add "$NETNS" || return 1
     ip netns exec "$NETNS" ip link set lo up || return 1
     for k in all default lo; do
@@ -230,6 +259,12 @@ ensure_netns() {
     sysctl -qw "net.ipv6.conf.${VETH_HOST}.disable_ipv6=1" 2>/dev/null || true
     ip link set dev "$VETH_HOST" mtu "$mtu" up || return 1
     sysctl -qw "net.ipv4.conf.${VETH_HOST}.rp_filter=1" 2>/dev/null || true
+
+    # Детерминированный аппаратный MAC-адрес Intel OUI (ac:1f:6b:XX:XX:XX)
+    local mac_hash synth_mac
+    mac_hash=$(printf '%s-enp3s0' "$CAGE_MACHINE_ID" | sha256sum | cut -c1-6)
+    synth_mac="ac:1f:6b:${mac_hash:0:2}:${mac_hash:2:2}:${mac_hash:4:2}"
+    ip netns exec "$NETNS" ip link set dev "$VETH_NS" address "$synth_mac" 2>/dev/null || true
 
     ip netns exec "$NETNS" ip addr replace "${NS_IP}/${PREFIX}" dev "$VETH_NS" || return 1
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" mtu "$mtu" up || return 1
@@ -579,7 +614,7 @@ cmd_run() {
                 mv -f "${user_local_bin}/claude" "${user_local_bin}/claude-raw"
                 cat << 'EOF_WRAP' > "${user_local_bin}/claude"
 #!/bin/bash
-if ip link show veth_ns >/dev/null 2>&1; then
+if ip link show enp3s0 >/dev/null 2>&1 || ip link show veth_ns >/dev/null 2>&1; then
     if [ -x "$HOME/.local/bin/claude-raw" ]; then exec "$HOME/.local/bin/claude-raw" "$@"; fi
     if [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
         exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
@@ -615,9 +650,7 @@ EOF_WRAP
 
     ((desktop)) && warn_no_sandbox
     proxy_start
-
-    local mid resolv="/etc/netns/${NETNS}/resolv.conf"
-    mid=$(synthetic_machine_id)
+    ensure_cage_machine_id
 
     # Дисплей X11 / Wayland
     local xdisp=${DISPLAY:-} xauth=${XAUTHORITY:-}
@@ -628,6 +661,11 @@ EOF_WRAP
     [[ -n $xauth && -f $xauth ]] || xauth="${REAL_HOME}/.Xauthority"
 
     # Очистка локали и геолокационных переменных среды
+    local safe_pwd="${PWD:-$REAL_HOME}"
+    if [[ -n "$CAGE_REPO_DIR" && "$safe_pwd" == "$CAGE_REPO_DIR"* ]] || [[ "$safe_pwd" =~ ClaudeCage|claudecage|claude-vpn|cld-cage ]]; then
+        safe_pwd="${REAL_HOME}"
+    fi
+
     local -a clean_env=(
         "BROWSER=${JAIL_XDG_OPEN}"
         "HOME=${REAL_HOME}"
@@ -639,6 +677,8 @@ EOF_WRAP
         "LANG=en_US.UTF-8"
         "LC_ALL=en_US.UTF-8"
         "TZ=${CLAUDE_TZ}"
+        "PWD=${safe_pwd}"
+        "OLDPWD=${safe_pwd}"
         "XDG_RUNTIME_DIR=${XDG_RUNTIME}"
         "XDG_DATA_HOME=${REAL_HOME}/.local/share"
         "XDG_CONFIG_HOME=${REAL_HOME}/.config"
@@ -662,36 +702,43 @@ EOF_WRAP
         --dev-bind / /
         --die-with-parent
         --unshare-uts
+        --unshare-pid
+        --proc /proc
         --hostname "$real_host"
     )
 
     # 1. TTY / Ctrl+C Fix: new-session строго для GUI Desktop, отключен для CLI
     if ((desktop)); then
         bw+=(--new-session)
+        has_arg --disable-quic || APP+=("--disable-quic")
         has_arg --force-webrtc-ip-handling-policy || APP+=("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
         has_arg --disable-features || APP+=("--disable-features=AsyncDns,DnsOverHttps")
         has_arg --password-store   || APP+=("--password-store=basic")
     fi
 
-    # 2. Маскировка сетевых интерфейсов в /sys/class/net:
-    # Исключает утечку физических адаптеров wlan0, eth0 и MAC-адресов через ФС
+    # 2. Маскировка сетевых интерфейсов в /sys/class/net (мимикрия под физический enp3s0)
     bw+=(
         --tmpfs /sys/class/net
         --dir /sys/class/net/lo
-        --dir /sys/class/net/veth_ns
+        --dir /sys/class/net/enp3s0
     )
 
-    # 3. Маскировка DMI идентификаторов железа хоста
+    # 3. Маскировка беспроводных подсистем ядра (Wi-Fi, regulatory domain)
+    [[ -d /sys/class/ieee80211 ]] && bw+=(--tmpfs /sys/class/ieee80211)
+    [[ -d /sys/bus/pci/drivers ]] && bw+=(--tmpfs /sys/bus/pci/drivers)
+    [[ -d /sys/module/cfg80211 ]] && bw+=(--tmpfs /sys/module/cfg80211)
+
+    # 4. Маскировка DMI идентификаторов железа хоста
     [[ -d /sys/devices/virtual/dmi/id ]] && bw+=(--tmpfs /sys/devices/virtual/dmi/id)
 
-    # 4. Оверлей /etc для спуфинга localtime, locale.conf и сокрытия клетки
+    # 5. Оверлей /etc для спуфинга localtime, locale.conf, machine-id и сокрытия клетки
     bw+=(--overlay-src /etc --tmp-overlay /etc)
 
-    # 5. Оверлеи /etc/systemd/system и /usr/local/bin для полного удаления следов клетки
+    # 6. Оверлеи /etc/systemd/system и /usr/local/bin для полного удаления следов клетки
     [[ -d /etc/systemd/system ]] && bw+=(--overlay-src /etc/systemd/system --tmp-overlay /etc/systemd/system)
     [[ -d /usr/local/bin ]] && bw+=(--overlay-src /usr/local/bin --tmp-overlay /usr/local/bin)
 
-    # 6. Сокрытие каталога репозитория ClaudeCage в домашней директории
+    # 7. Сокрытие каталога репозитория ClaudeCage в домашней директории
     if [[ -n "$CAGE_REPO_DIR" && -d "$CAGE_REPO_DIR" ]]; then
         bw+=(--tmpfs "$CAGE_REPO_DIR")
     fi
@@ -702,15 +749,11 @@ EOF_WRAP
         fi
     done
 
-    # 7. Изоляция D-Bus, systemd и ключей хоста
+    # 8. Изоляция D-Bus, systemd и ключей хоста (без bind mounts /etc/netns!)
     bw+=(
         --tmpfs /run/dbus
         --tmpfs /run/systemd/resolve
-        --ro-bind "$resolv" /run/systemd/resolve/stub-resolv.conf
-        --ro-bind "$resolv" /run/systemd/resolve/resolv.conf
-        --ro-bind "$mid" /etc/machine-id
     )
-    [[ -f /var/lib/dbus/machine-id && ! -L /var/lib/dbus/machine-id ]] && bw+=(--ro-bind "$mid" /var/lib/dbus/machine-id)
     [[ -e ${XDG_RUNTIME}/bus ]] && bw+=(--ro-bind /dev/null "${XDG_RUNTIME}/bus")
 
     local d
@@ -728,8 +771,8 @@ EOF_WRAP
     command -v dbus-run-session >/dev/null 2>&1 && dbw=(dbus-run-session --)
 
     # ── Внутрипесочный Entrypoint (Спуфинг в Оверлее) ─────────────
-    # Скрипт инициализирует оверлей /etc, подменяет localtime и удаляет
-    # любые упоминания клетки из файловой системы, после чего делает exec в процесс
+    # Скрипт инициализирует оверлей /etc, подменяет localtime, machine-id, resolv.conf
+    # и удаляет любые упоминания клетки из файловой системы перед передачей управления
     local entrypoint_code
     entrypoint_code=$(cat << 'EOF_ENTRY'
 # Спуфинг временной зоны (замена симлинка /etc/localtime на таймзону VPN)
@@ -741,9 +784,26 @@ rm -f /etc/locale.conf /etc/vconsole.conf 2>/dev/null || true
 printf "LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8\n" > /etc/locale.conf 2>/dev/null || true
 printf "KEYMAP=us\n" > /etc/vconsole.conf 2>/dev/null || true
 
-# Принудительный DNS VPN
+# Спуфинг раскладки клавиатуры X11 (XKB)
+if [ -d /etc/X11/xorg.conf.d ]; then
+    for kf in /etc/X11/xorg.conf.d/*keyboard*.conf /etc/X11/xorg.conf.d/*-keyboard.conf; do
+        if [ -f "$kf" ]; then
+            sed -i 's/XkbLayout.*/XkbLayout "us"/' "$kf" 2>/dev/null || true
+        fi
+    done
+fi
+
+# Спуфинг machine-id (отдельный изолированный идентификатор клетки)
+printf "%s\n" "__CAGE_MACHINE_ID__" > /etc/machine-id 2>/dev/null || true
+mkdir -p /var/lib/dbus 2>/dev/null || true
+printf "%s\n" "__CAGE_MACHINE_ID__" > /var/lib/dbus/machine-id 2>/dev/null || true
+
+# Принудительный DNS VPN (внутри оверлея /etc и tmpfs resolve без утечек mountinfo)
 rm -f /etc/resolv.conf 2>/dev/null || true
 printf "nameserver __VPN_DNS__\n" > /etc/resolv.conf 2>/dev/null || true
+mkdir -p /run/systemd/resolve 2>/dev/null || true
+printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/stub-resolv.conf 2>/dev/null || true
+printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/resolv.conf 2>/dev/null || true
 
 # Полное удаление любых файлов и сервисов клетки из оверлеев ФС
 rm -f /etc/cld-cage* /etc/claude-vpn* /etc/sudoers.d/cld-cage* /etc/sudoers.d/claude-vpn* 2>/dev/null || true
@@ -756,6 +816,7 @@ EOF_ENTRY
     )
     entrypoint_code="${entrypoint_code//__CLAUDE_TZ__/$CLAUDE_TZ}"
     entrypoint_code="${entrypoint_code//__VPN_DNS__/$VPN_DNS}"
+    entrypoint_code="${entrypoint_code//__CAGE_MACHINE_ID__/$CAGE_MACHINE_ID}"
 
     local -a full_exec=(
         ip netns exec "$NETNS"

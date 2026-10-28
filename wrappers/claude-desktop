@@ -3,7 +3,7 @@
 # Claude Desktop Transparent Wrapper
 # Runs Claude Desktop inside the stealth network namespace
 # ============================================================
-if ip link show veth_ns >/dev/null 2>&1; then
+if ip link show enp3s0 >/dev/null 2>&1 || ip link show veth_ns >/dev/null 2>&1; then
     if [ -x "/usr/bin/claude-desktop" ]; then
         exec "/usr/bin/claude-desktop" "$@"
     elif [ -x "/usr/lib/claude-desktop/claude-desktop" ]; then
