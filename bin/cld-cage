@@ -446,6 +446,7 @@ cmd_status() {
 
 cmd_monitor() {
     load_config || exit 1
+    resolve_user || true
     netns_exists || die "Сетевое пространство $NETNS не запущено. Запустите: cld-cage --up"
     
     echo -e "${C_B}${C_C}=== Мониторинг сетевых соединений ClaudeCage ($NETNS) ===${C_0}"
@@ -454,6 +455,10 @@ cmd_monitor() {
     
     local log_dir="${REAL_HOME:-$HOME}/.local/state/cld-cage"
     mkdir -p "$log_dir" 2>/dev/null || true
+    if [[ -d "/root/.local/state/cld-cage" && "$log_dir" != "/root/.local/state/cld-cage" ]]; then
+        cp -rn /root/.local/state/cld-cage/* "$log_dir/" 2>/dev/null || true
+    fi
+    [[ -n "${REAL_USER:-}" && -n "${REAL_GID:-}" ]] && chown -R "${REAL_UID}:${REAL_GID}" "$log_dir" 2>/dev/null || true
     local log_file="${log_dir}/traffic_$(date +%Y-%m-%d).log"
     
     if command -v conntrack >/dev/null 2>&1; then
