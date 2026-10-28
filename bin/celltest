@@ -307,6 +307,9 @@ header "4. Невидимость и Сокрытие Клетки от ИИ-А�
 
 if ((DO_APP)) && [[ "$netns_active" = true ]]; then
     # 4.1. Сокрытие репозитория ClaudeCage
+    if [[ ! -d "$CAGE_REPO_DIR" && -d "$HOME/.ClaudeCage_Linux" ]]; then
+        CAGE_REPO_DIR="$HOME/.ClaudeCage_Linux"
+    fi
     repo_leak=$(cvpn_exec /bin/bash -c '
         if [ -d "'"${CAGE_REPO_DIR}"'" ]; then
             ls -A "'"${CAGE_REPO_DIR}"'" 2>/dev/null | wc -l

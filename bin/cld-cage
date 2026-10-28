@@ -107,6 +107,9 @@ load_config() {
     if [[ -n $v ]]; then [[ $v =~ $TZ_RE ]] || { err "CLD_TZ некорректен: '$v'"; return 1; }; CLD_TZ=$v; CLAUDE_TZ=$v; fi
     v=$(conf_get "$f" CAGE_REPO_DIR)
     if [[ -n $v ]]; then CAGE_REPO_DIR=$v; fi
+    if [[ ! -d "$CAGE_REPO_DIR" && -d "${REAL_HOME:-$HOME}/.ClaudeCage_Linux" ]]; then
+        CAGE_REPO_DIR="${REAL_HOME:-$HOME}/.ClaudeCage_Linux"
+    fi
     return 0
 }
 
