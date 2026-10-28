@@ -743,6 +743,9 @@ EOF
 resolve_user() {
     REAL_USER=${SUDO_USER:-}
     [[ -n $REAL_USER ]] || REAL_USER=$(logname 2>/dev/null) || true
+    if [[ -z $REAL_USER || $REAL_USER == root ]]; then
+        REAL_USER=$(find /home -maxdepth 1 -mindepth 1 -type d -not -name "root" -printf "%f\n" 2>/dev/null | head -n1 || echo "")
+    fi
     [[ -n $REAL_USER && $REAL_USER != root ]] || return 1
     REAL_UID=$(id -u "$REAL_USER") || return 1
     REAL_GID=$(id -g "$REAL_USER") || return 1
@@ -1474,6 +1477,15 @@ class ClaudeProbe:
 
         # Определение домашнего каталога реального пользователя
         user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "user"
+        if user == "root":
+            try:
+                import glob
+                homes = [h for h in glob.glob("/home/*") if os.path.isdir(h)]
+                if homes:
+                    user = os.path.basename(homes[0])
+            except Exception:
+                pass
+        self.target_user = user
         try:
             import pwd
             home = pwd.getpwnam(user).pw_dir
@@ -1554,7 +1566,15 @@ class ClaudeProbe:
         cvpn = "/usr/local/bin/cld-cage"
         if not os.path.exists(cvpn):
             cvpn = "/usr/local/bin/claude-vpn"
-        cmd = ["sudo", cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
+        
+        env = os.environ.copy()
+        env["SUDO_USER"] = getattr(self, "target_user", "milk13")
+
+        if os.geteuid() == 0:
+            cmd = [cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
+        else:
+            cmd = ["sudo", "-E", cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
+
         try:
             # Запускаем в нейтральном каталоге /tmp, чтобы не вызвать сработку защиты директории
             proc = subprocess.run(
@@ -1562,6 +1582,7 @@ class ClaudeProbe:
                 cwd="/tmp",
                 text=True,
                 capture_output=True,
+                env=env,
                 timeout=25
             )
             if proc.returncode != 0:

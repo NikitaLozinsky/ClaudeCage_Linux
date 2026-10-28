@@ -537,6 +537,9 @@ EOF
 resolve_user() {
     REAL_USER=${SUDO_USER:-}
     [[ -n $REAL_USER ]] || REAL_USER=$(logname 2>/dev/null) || true
+    if [[ -z $REAL_USER || $REAL_USER == root ]]; then
+        REAL_USER=$(find /home -maxdepth 1 -mindepth 1 -type d -not -name "root" -printf "%f\n" 2>/dev/null | head -n1 || echo "")
+    fi
     [[ -n $REAL_USER && $REAL_USER != root ]] || return 1
     REAL_UID=$(id -u "$REAL_USER") || return 1
     REAL_GID=$(id -g "$REAL_USER") || return 1
