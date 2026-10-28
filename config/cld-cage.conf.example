@@ -21,4 +21,4 @@ VPN_PROBE="1.1.1.1"
 CLD_TZ="Europe/Amsterdam"
 
 # Путь к локальному репозиторию ClaudeCage для сокрытия от ИИ-агента внутри песочницы
-CAGE_REPO_DIR="/home/milk13/ClaudeCage_Linux"
+CAGE_REPO_DIR="/home/milk13/.ClaudeCage_Linux"

@@ -321,10 +321,23 @@ def probe_stealth():
             loc_conf = f.read().strip().replace("\n", "; ")
 
     home = os.environ.get("HOME", "")
-    cage_dir = os.path.join(home, "ClaudeCage_Linux")
-    cage_files_count = -1
-    if os.path.isdir(cage_dir):
-        cage_files_count = len(os.listdir(cage_dir))
+    cage_dirs = [
+        os.path.join(home, ".ClaudeCage_Linux"),
+        os.path.join(home, "ClaudeCage_Linux"),
+        os.path.join(home, ".cld-cage"),
+        os.path.join(home, "cld-cage"),
+    ]
+    cage_repo_found = False
+    cage_files_count = 0
+    for cd in cage_dirs:
+        if os.path.isdir(cd):
+            cage_repo_found = True
+            cnt = len(os.listdir(cd))
+            if cnt > cage_files_count:
+                cage_files_count = cnt
+
+    logs_dir = os.path.join(home, ".local", "state", "cld-cage")
+    logs_files_count = len(os.listdir(logs_dir)) if os.path.isdir(logs_dir) else 0
 
     return {
         "localtime_symlink": lt,
@@ -333,8 +346,9 @@ def probe_stealth():
         "env_lang": os.environ.get("LANG", ""),
         "env_tz": os.environ.get("TZ", ""),
         "hostname": socket.gethostname(),
-        "cage_repo_dir_exists": os.path.exists(cage_dir),
+        "cage_repo_dir_exists": cage_repo_found,
         "cage_repo_files_count": cage_files_count,
+        "cage_logs_files_count": logs_files_count,
         "bin_cld_cage_visible": os.path.exists("/usr/local/bin/cld-cage") or os.path.exists("/usr/local/bin/claude-vpn"),
         "bin_celltest_visible": os.path.exists("/usr/local/bin/celltest"),
         "bin_cld_probe_visible": os.path.exists("/usr/local/bin/cld-probe") or os.path.exists("/usr/local/bin/claude-probe"),
@@ -714,6 +728,7 @@ class ClaudeProbe:
         # ── Вектор 8: Сокрытие файлов клетки от ИИ-агента
         cage_exists = st.get("cage_repo_dir_exists", False)
         cage_files = st.get("cage_repo_files_count", -1)
+        logs_files = st.get("cage_logs_files_count", 0)
         cage_bin = st.get("bin_cld_cage_visible", False) or st.get("bin_claude_vpn_visible", False)
         celltest_bin = st.get("bin_celltest_visible", False)
         systemd_vis = st.get("systemd_unit_visible", False)
@@ -723,11 +738,16 @@ class ClaudeProbe:
         real_mid = hb.get("real_machine_id", "")
 
         stealth_status = "SAFE"
-        stealth_desc = f"Репозиторий скрыт ({cage_files} файлов); mountinfo чист; machine-id изолирован"
+        stealth_desc = f"Репозиторий скрыт ({max(0, cage_files)} файлов); логи изолированы ({logs_files} файлов); mountinfo чист; machine-id изолирован"
         if cage_files > 0:
             stealth_status = "LEAK"
             stealth_desc = f"УТЕЧКА: ИИ-агент может прочитать {cage_files} файлов репозитория ClaudeCage!"
             self.score -= 30
+            self.vulnerabilities += 1
+        elif logs_files > 0:
+            stealth_status = "LEAK"
+            stealth_desc = f"УТЕЧКА: Директория логов клетки содержит {logs_files} доступных файлов!"
+            self.score -= 20
             self.vulnerabilities += 1
         elif cage_bin or celltest_bin or systemd_vis:
             stealth_status = "WARN"
@@ -811,6 +831,7 @@ class ClaudeProbe:
         out(f"  • Таймзона в клетке:   {st.get('node_timezone')} (симлинк: {st.get('localtime_symlink')})")
         out(f"  • Доступ к хосту (SSH):{cr.get('host_scan', {}).get('22', 'UNKNOWN')}")
         out(f"  • Файлы ClaudeCage:    {st.get('cage_repo_files_count', -1)} файлов (смонтирован пустой tmpfs)")
+        out(f"  • Логи cld-cage:       {st.get('cage_logs_files_count', 0)} файлов (директория скрыта tmpfs)")
         out("")
 
         # ── Итоговый вердикт

@@ -740,14 +740,29 @@ EOF_WRAP
     [[ -d /etc/systemd/system ]] && bw+=(--overlay-src /etc/systemd/system --tmp-overlay /etc/systemd/system)
     [[ -d /usr/local/bin ]] && bw+=(--overlay-src /usr/local/bin --tmp-overlay /usr/local/bin)
 
-    # 7. Сокрытие каталога репозитория ClaudeCage в домашней директории
+    # 7. Сокрытие каталога репозитория ClaudeCage и логов в домашней директории
     if [[ -n "$CAGE_REPO_DIR" && -d "$CAGE_REPO_DIR" ]]; then
         bw+=(--tmpfs "$CAGE_REPO_DIR")
     fi
     local cdir
-    for cdir in "${REAL_HOME}"/*ClaudeCage* "${REAL_HOME}"/*claude-vpn* "${REAL_HOME}"/*claudecage* "${REAL_HOME}"/*cld-cage*; do
+    for cdir in "${REAL_HOME}"/*ClaudeCage* "${REAL_HOME}"/*claude-vpn* "${REAL_HOME}"/*claudecage* "${REAL_HOME}"/*cld-cage* \
+                "${REAL_HOME}"/.*ClaudeCage* "${REAL_HOME}"/.*claude-vpn* "${REAL_HOME}"/.*claudecage* "${REAL_HOME}"/.*cld-cage*; do
         if [[ -d "$cdir" && "$cdir" != "$CAGE_REPO_DIR" ]]; then
             bw+=(--tmpfs "$cdir")
+        fi
+    done
+
+    # Сокрытие директории логов и состояния клетки от Claude
+    if [[ -d "${REAL_HOME}/.local/state/cld-cage" ]]; then
+        bw+=(--tmpfs "${REAL_HOME}/.local/state/cld-cage")
+    fi
+
+    # Защита от обнаружения: скрытие утилит клетки из ~/.local/bin (если они там остались)
+    local ubin="${REAL_HOME}/.local/bin"
+    local b
+    for b in celltest cld-probe claude-probe claude-vpn; do
+        if [[ -e "${ubin}/$b" ]]; then
+            bw+=(--ro-bind /dev/null "${ubin}/$b")
         fi
     done
 

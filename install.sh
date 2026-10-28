@@ -196,23 +196,18 @@ chmod +x "${USER_BIN}/claude-desktop"
 chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/claude-desktop"
 info "Установлена обёртка GUI: ${USER_BIN}/claude-desktop"
 
-# Диагностическая утилита celltest
-cp -f "$HERE/bin/celltest" "${USER_BIN}/celltest"
-chmod +x "${USER_BIN}/celltest"
-chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/celltest"
+# Диагностическая утилита celltest (устанавливается только в /usr/local/bin для скрытности от клетки)
 sudo cp -f "$HERE/bin/celltest" /usr/local/bin/celltest
 sudo chmod 0755 /usr/local/bin/celltest
-info "Установлена утилита диагностики celltest в ${USER_BIN}/celltest и /usr/local/bin/celltest"
+rm -f "${USER_BIN}/celltest" 2>/dev/null || true
+info "Установлена утилита диагностики celltest в /usr/local/bin/celltest"
 
-# Аудитор и логгер сетевой видимости cld-probe
-cp -f "$HERE/bin/cld-probe" "${USER_BIN}/cld-probe"
-chmod +x "${USER_BIN}/cld-probe"
-chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/cld-probe"
-ln -sf cld-probe "${USER_BIN}/claude-probe"
+# Аудитор и логгер сетевой видимости cld-probe (устанавливается только в /usr/local/bin для скрытности от клетки)
 sudo cp -f "$HERE/bin/cld-probe" /usr/local/bin/cld-probe
 sudo chmod 0755 /usr/local/bin/cld-probe
 sudo ln -sf cld-probe /usr/local/bin/claude-probe
-info "Установлен логгер и аудитор cld-probe в ${USER_BIN}/cld-probe и /usr/local/bin/cld-probe"
+rm -f "${USER_BIN}/cld-probe" "${USER_BIN}/claude-probe" "${USER_BIN}/claude-vpn" 2>/dev/null || true
+info "Установлен логгер и аудитор cld-probe в /usr/local/bin/cld-probe"
 
 # Fish функции
 if command -v fish &>/dev/null; then

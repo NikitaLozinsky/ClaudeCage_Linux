@@ -351,7 +351,39 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "УТЕЧКА: Службы cld-cage / claude-vpn видны в /etc/systemd/system ($unit_leak файлов)!"
     fi
 
-    # 4.5. Маскировка сетевых интерфейсов в /sys/class/net (мимикрия физического адаптера enp3s0)
+    # 4.5. Сокрытие директории логов клетки (~/.local/state/cld-cage)
+    log_leak=$(cvpn_exec /bin/bash -c '
+        if [ -d "$HOME/.local/state/cld-cage" ]; then
+            ls -A "$HOME/.local/state/cld-cage" 2>/dev/null | wc -l
+        else
+            echo "0"
+        fi
+    ' 2>/dev/null || echo "0")
+    log_leak=$(echo "$log_leak" | tail -n1 | tr -d '[:space:]')
+    log_leak=${log_leak:-0}
+    if [[ "$log_leak" =~ ^[0-9]+$ ]] && [[ "$log_leak" -eq 0 ]]; then
+        pass "Директория логов (~/.local/state/cld-cage) скрыта (пустой tmpfs, 0 файлов)"
+    else
+        fail "УТЕЧКА: Логи клетки видны внутри песочницы ($log_leak файлов)!"
+    fi
+
+    # 4.6. Сокрытие утилит клетки из ~/.local/bin
+    local_bin_leak=$(cvpn_exec /bin/bash -c '
+        cnt=0
+        for f in celltest cld-probe claude-probe claude-vpn; do
+            [ -x "$HOME/.local/bin/$f" ] && [ -s "$HOME/.local/bin/$f" ] && ((cnt++)) || true
+        done
+        echo "$cnt"
+    ' 2>/dev/null || echo "0")
+    local_bin_leak=$(echo "$local_bin_leak" | tail -n1 | tr -d '[:space:]')
+    local_bin_leak=${local_bin_leak:-0}
+    if [[ "$local_bin_leak" =~ ^[0-9]+$ ]] && [[ "$local_bin_leak" -eq 0 ]]; then
+        pass "Утилиты клетки в ~/.local/bin полностью скрыты или очищены"
+    else
+        fail "УТЕЧКА: Утилиты клетки доступны в ~/.local/bin ($local_bin_leak файлов)!"
+    fi
+
+    # 4.7. Маскировка сетевых интерфейсов в /sys/class/net (мимикрия физического адаптера enp3s0)
     sys_links=$(cvpn_exec /bin/bash -c 'ls -1 /sys/class/net 2>/dev/null | sort | tr "\n" " "' 2>/dev/null || echo "")
     trimmed_links=$(echo "$sys_links" | xargs)
     if [[ "$trimmed_links" == "enp3s0 lo" || "$trimmed_links" == "lo enp3s0" || "$trimmed_links" == "lo veth_ns" ]]; then
@@ -360,7 +392,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         warn "/sys/class/net содержит посторонние интерфейсы: '$sys_links' (проверьте сокрытие)"
     fi
 
-    # 4.6. Hostname
+    # 4.8. Hostname
     jail_host=$(cvpn_exec hostname 2>/dev/null || echo "")
     jail_host=$(echo "$jail_host" | tail -n1)
     host_host=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "")
@@ -370,7 +402,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         warn "Имя хоста внутри клетки: '$jail_host' (хостовое: '$host_host')"
     fi
 
-    # 4.7. NoNewPrivs
+    # 4.9. NoNewPrivs
     nnp=$(cvpn_exec /bin/bash -c 'awk "/NoNewPrivs/{print \$2}" /proc/self/status' 2>/dev/null || echo "0")
     nnp=$(echo "$nnp" | tail -n1 | tr -d '[:space:]')
     if [[ "$nnp" == "1" ]]; then
@@ -379,7 +411,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "NoNewPrivs не выставлен!"
     fi
 
-    # 4.8. Сессионная шина D-Bus
+    # 4.10. Сессионная шина D-Bus
     bus_leak=$(cvpn_exec /bin/bash -c '[ -S "/run/user/'"${REAL_UID}"'/bus" ] && echo "LEAK" || echo "MASKED"' 2>/dev/null || echo "MASKED")
     bus_leak=$(echo "$bus_leak" | tail -n1)
     if [[ "$bus_leak" == "MASKED" ]]; then
@@ -388,7 +420,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "УТЕЧКА D-BUS: Сессионная шина хоста доступна из клетки!"
     fi
 
-    # 4.9. Изоляция /proc/1/net/dev и /proc/1/net/arp (PID Namespace)
+    # 4.11. Изоляция /proc/1/net/dev и /proc/1/net/arp (PID Namespace)
     proc_dev_leak=$(cvpn_exec /bin/bash -c 'grep -E "wlan|amn" /proc/1/net/dev 2>/dev/null || true')
     if [[ -z "$proc_dev_leak" ]]; then
         pass "Изоляция /proc/1/net/dev: сетевые интерфейсы хоста (wlan0, amn0) скрыты"
@@ -396,7 +428,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "УТЕЧКА: /proc/1/net/dev содержит интерфейсы хоста: $proc_dev_leak"
     fi
 
-    # 4.10. Изоляция /proc/*/environ (ru_RU)
+    # 4.12. Изоляция /proc/*/environ (ru_RU)
     proc_env_leak=$(cvpn_exec /bin/bash -c 'grep -rn "ru_RU" /proc/[0-9]*/environ 2>/dev/null | wc -l || echo 0')
     proc_env_leak=$(echo "$proc_env_leak" | tail -n1 | tr -d '[:space:]')
     if [[ "$proc_env_leak" -eq 0 ]]; then
@@ -405,7 +437,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "УТЕЧКА: /proc/*/environ содержит русскую локаль хоста ($proc_env_leak совпадений)!"
     fi
 
-    # 4.11. Спуфинг /etc/machine-id
+    # 4.13. Спуфинг /etc/machine-id
     host_mid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || echo "")
     cage_mid=$(cvpn_exec /bin/bash -c 'cat /etc/machine-id 2>/dev/null || echo ""')
     cage_mid=$(echo "$cage_mid" | tail -n1 | tr -d '[:space:]')
@@ -417,7 +449,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         warn "/etc/machine-id в клетке: '$cage_mid' (длина: ${#cage_mid})"
     fi
 
-    # 4.12. Чистота /proc/self/mountinfo
+    # 4.14. Чистота /proc/self/mountinfo
     mount_leak=$(cvpn_exec /bin/bash -c 'grep "/etc/netns/cld_net" /proc/self/mountinfo 2>/dev/null || true')
     if [[ -z "$mount_leak" ]]; then
         pass "Чистота /proc/self/mountinfo: пути /etc/netns/cld_net отсутствуют"
@@ -425,7 +457,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "УТЕЧКА: В /proc/self/mountinfo обнаружен путь netns: $mount_leak"
     fi
 
-    # 4.13. Маскировка беспроводных подсистем ядра в /sys
+    # 4.15. Маскировка беспроводных подсистем ядра в /sys
     wifi_leak=$(cvpn_exec /bin/bash -c 'ls -A /sys/class/ieee80211 2>/dev/null | wc -l')
     wifi_leak=$(echo "$wifi_leak" | tail -n1 | tr -d '[:space:]')
     if [[ "$wifi_leak" -eq 0 ]]; then
@@ -434,7 +466,7 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
         fail "УТЕЧКА: В /sys/class/ieee80211 видны устройства Wi-Fi ($wifi_leak шт.)!"
     fi
 
-    # 4.14. Мимикрия аппаратного MAC-адреса (Intel OUI ac:1f:6b)
+    # 4.16. Мимикрия аппаратного MAC-адреса (Intel OUI ac:1f:6b)
     cage_mac=$(ip netns exec "$NETNS" cat /sys/class/net/"$VETH_NS"/address 2>/dev/null || true)
     if [[ "$cage_mac" =~ ^ac:1f:6b:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$ ]]; then
         pass "Аппаратный MAC интерфейса $VETH_NS: $cage_mac (Intel OUI ac:1f:6b)"
