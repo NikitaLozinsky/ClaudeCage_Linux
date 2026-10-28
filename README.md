@@ -21,11 +21,17 @@ flowchart TD
     end
 
     subgraph Stealth["🕵️ Стелс-слой и Защита от Деанонимизации"]
-        HIDE["📁 Полное сокрытие каталога ClaudeCage и бинарников клетки"]
-        NET_HIDE["🔌 Маскировка /sys/class/net (только lo и veth_ns, без wlan0/eth0)"]
-        TZ_SPOOF["🕒 Симлинк /etc/localtime -> zoneinfo VPN (никакой Europe/Moscow)"]
-        LOC_SPOOF["🌐 /etc/locale.conf = en_US.UTF-8 (без следов ru_RU)"]
-        HOST_KEEP["💻 Естественный Hostname хоста (никаких suspicious 'jail' имен)"]
+        HIDE["📁 Сокрытие артефактов клетки (репозиторий ClaudeCage и бинарники)"]
+        NET_HIDE["🔌 Маскировка /sys/class/net (только lo и veth_ns, скрыты wlan/eth/MAC)"]
+        TZ_SPOOF["🕒 Подмена /etc/localtime (симлинк на таймзону VPN)"]
+        LOC_SPOOF["🌐 Спуфинг /etc/locale.conf и env (en_US.UTF-8, очистка ru_RU)"]
+        HOST_KEEP["💻 Естественный Hostname хоста (отсутствие suspicious маркеров 'jail')"]
+
+        HIDE -->|"Маскировка устройств"| NET_HIDE
+        HIDE -->|"Оверлей /etc"| TZ_SPOOF
+        TZ_SPOOF -->|"Синхронизация региона"| LOC_SPOOF
+        NET_HIDE --> HOST_KEEP
+        LOC_SPOOF --> HOST_KEEP
     end
 
     subgraph Defense["🛡️ Ядро безопасности ClaudeCage (Linux Kernel Sandbox)"]
@@ -43,7 +49,8 @@ flowchart TD
         ETH["🔴 Физический адаптер хоста (Wi-Fi wlan0 / Ethernet eth0)"]
     end
 
-    CL --> Stealth --> BWRAP --> TTY_FIX --> DBUS --> NETNS --> NFT
+    CL --> HIDE
+    HOST_KEEP --> BWRAP --> TTY_FIX --> DBUS --> NETNS --> NFT
     NETNS -.->|"DNS-запросы"| DNAT
 
     NFT -->|"Разрешено: трафик строго в туннель"| VPN
