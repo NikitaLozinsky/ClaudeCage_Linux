@@ -476,9 +476,8 @@ ensure_netns() {
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" mtu "$mtu" up || return 1
     ip netns exec "$NETNS" ip route replace default via "$HOST_IP" dev "$VETH_NS" || return 1
 
-    mkdir -p "/etc/netns/${NETNS}"
-    printf 'nameserver %s\n' "$VPN_DNS" >"/etc/netns/${NETNS}/resolv.conf.new" &&
-        mv -f "/etc/netns/${NETNS}/resolv.conf.new" "/etc/netns/${NETNS}/resolv.conf"
+    # Исключение утечек /etc/netns в mountinfo: каталог netns не создаётся на хосте
+    rm -rf "/etc/netns/${NETNS}" 2>/dev/null || true
 }
 
 save_orig_forward() {
@@ -955,11 +954,12 @@ EOF_WRAP
         fi
     done
 
-    # 8. Изоляция D-Bus, systemd и ключей хоста (без bind mounts /etc/netns!)
+    # 8. Изоляция D-Bus, systemd, netns и ключей хоста (без bind mounts /etc/netns!)
     bw+=(
         --tmpfs /run/dbus
         --tmpfs /run/systemd/resolve
     )
+    [[ -d /run/netns ]] && bw+=(--tmpfs /run/netns)
     [[ -e ${XDG_RUNTIME}/bus ]] && bw+=(--ro-bind /dev/null "${XDG_RUNTIME}/bus")
 
     local d
@@ -1000,9 +1000,8 @@ if [ -d /etc/X11/xorg.conf.d ]; then
 fi
 
 # Спуфинг machine-id (отдельный изолированный идентификатор клетки)
+rm -f /etc/machine-id 2>/dev/null || true
 printf "%s\n" "__CAGE_MACHINE_ID__" > /etc/machine-id 2>/dev/null || true
-mkdir -p /var/lib/dbus 2>/dev/null || true
-printf "%s\n" "__CAGE_MACHINE_ID__" > /var/lib/dbus/machine-id 2>/dev/null || true
 
 # Принудительный DNS VPN (внутри оверлея /etc и tmpfs resolve без утечек mountinfo)
 rm -f /etc/resolv.conf 2>/dev/null || true
@@ -2510,7 +2509,7 @@ fi
 header "5. DNS Изоляция и Перехват DNAT"
 
 # Проверка resolv.conf
-dns_srv=$(ip netns exec "$NETNS" cat /etc/resolv.conf 2>/dev/null | grep "nameserver" | awk '{print $2}' || true)
+dns_srv=$(cvpn_exec cat /etc/resolv.conf 2>/dev/null | grep "nameserver" | awk '{print $2}' || true)
 if [[ "$dns_srv" == "$VPN_DNS" ]]; then
     pass "DNS внутри клетки указывает только на $VPN_DNS (изолированный резолвер VPN)"
 else
@@ -2526,7 +2525,7 @@ fi
 
 # Резолв api.anthropic.com
 if [[ "$vpn_active" = true && "$netns_active" = true ]]; then
-    if ip netns exec "$NETNS" getent hosts api.anthropic.com &>/dev/null; then
+    if cvpn_exec getent hosts api.anthropic.com &>/dev/null || ip netns exec "$NETNS" getent hosts api.anthropic.com &>/dev/null; then
         pass "DNS резолв api.anthropic.com через VPN-туннель: РАБОТАЕТ"
     else
         fail "Не удается разрешить домен api.anthropic.com через VPN-резолвер"

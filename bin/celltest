@@ -450,7 +450,7 @@ fi
 header "5. DNS Изоляция и Перехват DNAT"
 
 # Проверка resolv.conf
-dns_srv=$(ip netns exec "$NETNS" cat /etc/resolv.conf 2>/dev/null | grep "nameserver" | awk '{print $2}' || true)
+dns_srv=$(cvpn_exec cat /etc/resolv.conf 2>/dev/null | grep "nameserver" | awk '{print $2}' || true)
 if [[ "$dns_srv" == "$VPN_DNS" ]]; then
     pass "DNS внутри клетки указывает только на $VPN_DNS (изолированный резолвер VPN)"
 else
@@ -466,7 +466,7 @@ fi
 
 # Резолв api.anthropic.com
 if [[ "$vpn_active" = true && "$netns_active" = true ]]; then
-    if ip netns exec "$NETNS" getent hosts api.anthropic.com &>/dev/null; then
+    if cvpn_exec getent hosts api.anthropic.com &>/dev/null || ip netns exec "$NETNS" getent hosts api.anthropic.com &>/dev/null; then
         pass "DNS резолв api.anthropic.com через VPN-туннель: РАБОТАЕТ"
     else
         fail "Не удается разрешить домен api.anthropic.com через VPN-резолвер"
