@@ -25,6 +25,12 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # 1. Определение целевого пользователя
 TARGET_USER="${SUDO_USER:-$USER}"
+if [[ "$TARGET_USER" == "root" ]]; then
+    DETECTED_USER=$(find /home -maxdepth 1 -mindepth 1 -type d -not -name "root" -printf "%f\n" 2>/dev/null | head -n1 || echo "")
+    if [[ -n "$DETECTED_USER" ]]; then
+        TARGET_USER="$DETECTED_USER"
+    fi
+fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 TARGET_GROUP=$(id -gn "$TARGET_USER")
 
@@ -64,11 +70,12 @@ fi
 step "Валидация синтаксиса скриптов"
 for f in bin/cld-cage bin/celltest bin/xdg-open-jail bin/cld-probe wrappers/claude wrappers/claude-desktop; do
     if [[ $f == *.py || $f == *probe ]]; then
-        python3 -m py_compile "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
+        python3 -c "import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())" "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
     else
         bash -n "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
     fi
 done
+sudo rm -rf "$HERE/bin/__pycache__" "$HERE/__pycache__" 2>/dev/null || true
 info "Синтаксис всех скриптов проверен!"
 
 # 4. Установка системных бинарников
@@ -78,7 +85,7 @@ sudo mkdir -p /usr/local/bin /usr/local/lib/cld-cage
 # Остановка старых служб claude-vpn (миграция на cld-cage)
 sudo systemctl stop cld-cage-watchdog.service cld-cage.service claude-vpn-watchdog.service claude-vpn.service 2>/dev/null || true
 sudo systemctl disable claude-vpn-watchdog.service claude-vpn.service 2>/dev/null || true
-sudo rm -f /etc/systemd/system/claude-vpn*.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/claude-vpn* 2>/dev/null || true
 
 # Сброс старой клетки перед обновлением
 if [[ -x /usr/local/bin/cld-cage ]]; then
@@ -95,11 +102,11 @@ sudo chmod 0755 /usr/local/bin/cld-cage
 sudo ln -sf cld-cage /usr/local/bin/claude-vpn
 info "Установлен /usr/local/bin/cld-cage (алиас: /usr/local/bin/claude-vpn)"
 
-sudo cp -f "$HERE/bin/xdg-open-jail" /usr/local/lib/cld-cage/xdg-open-jail
-sudo chown root:root /usr/local/lib/cld-cage/xdg-open-jail
-sudo chmod 0755 /usr/local/lib/cld-cage/xdg-open-jail
-sudo rm -rf /usr/local/lib/claude-vpn 2>/dev/null || true
-info "Установлен /usr/local/lib/cld-cage/xdg-open-jail (root:root 0755)"
+sudo cp -f "$HERE/bin/xdg-open-jail" /usr/local/lib/xdg-desktop-handler
+sudo chown root:root /usr/local/lib/xdg-desktop-handler
+sudo chmod 0755 /usr/local/lib/xdg-desktop-handler
+sudo rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn /run/cld-cage 2>/dev/null || true
+info "Установлен /usr/local/lib/xdg-desktop-handler (root:root 0755)"
 
 # 5. Настройка безопасного sudoers с visudo
 step "Настройка безопасного sudoers"
@@ -111,11 +118,11 @@ cat << EOF_SUDO > "$tmp_sudoers"
 # ClaudeCage v3.1 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
 # Defaults env_reset and !use_pty prevent environment injection, TTY hijacking and LPE vulnerabilities
 Defaults env_reset
-Defaults!/usr/local/bin/cld-cage !use_pty
-Defaults!/usr/local/bin/claude-vpn !use_pty
-Defaults!/usr/local/bin/celltest !use_pty
-Defaults!/usr/local/bin/cld-probe !use_pty
-Defaults!/usr/local/bin/claude-probe !use_pty
+Defaults!/usr/local/bin/cld-cage !use_pty, !requiretty
+Defaults!/usr/local/bin/claude-vpn !use_pty, !requiretty
+Defaults!/usr/local/bin/celltest !use_pty, !requiretty
+Defaults!/usr/local/bin/cld-probe !use_pty, !requiretty
+Defaults!/usr/local/bin/claude-probe !use_pty, !requiretty
 ${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/bin/cld-cage, /usr/local/bin/claude-vpn, /usr/local/bin/celltest, /usr/local/bin/cld-probe, /usr/local/bin/claude-probe
 EOF_SUDO
 
@@ -222,7 +229,11 @@ fi
 DESKTOP_DIR="${TARGET_HOME}/.local/share/applications"
 if [[ -d "$HERE/desktop" ]]; then
     mkdir -p "$DESKTOP_DIR"
-    cp -f "$HERE/desktop/"*.desktop "$DESKTOP_DIR/" 2>/dev/null || true
+    for dtf in "$HERE/desktop/"*.desktop; do
+        if [[ -f "$dtf" ]]; then
+            sed "s|/home/milk13/\.local/bin/claude-desktop|${TARGET_HOME}/.local/bin/claude-desktop|g; s|/usr/local/bin/cld-cage claude-desktop|${TARGET_HOME}/.local/bin/claude-desktop|g" "$dtf" > "${DESKTOP_DIR}/${dtf##*/}"
+        fi
+    done
     chown -R "${TARGET_USER}:${TARGET_GROUP}" "$DESKTOP_DIR" 2>/dev/null || true
     info "Обновлен ярлык меню приложений"
 fi

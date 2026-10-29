@@ -15,8 +15,8 @@
 |---|---|---|
 | **Оркестратор** | `/usr/local/bin/cld-cage` | Главный скрипт: bwrap, netns, policy routing, nftables, watchdog. (Алиас: `claude-vpn`) |
 | **Аудитор / Логгер** | `/usr/local/bin/cld-probe` | Python 3 (-I isolated) инструмент аудита 8 векторов атак и живой монитор трафика клетки (`--monitor`). (Алиас: `claude-probe`) |
-| **Диагностика** | `/usr/local/bin/celltest` | Проверка ядра (46 тестов), netns, nftables, watchdog, concealment изнутри и снаружи. |
-| **Перехватчик URL** | `/usr/local/lib/cld-cage/xdg-open-jail` | Заменяет браузер внутри клетки: копирует URL в буфер хоста и шлёт notification. |
+| **Диагностика** | `/usr/local/bin/celltest` | Проверка ядра (53 теста), netns, nftables, watchdog, concealment изнутри и снаружи. |
+| **Перехватчик URL** | `/usr/local/lib/xdg-desktop-handler` | Заменяет браузер внутри клетки: копирует URL в буфер хоста и шлёт notification. |
 | **Конфигурация** | `/etc/cld-cage.conf` | root:root 0644. Парсинг регулярками (без `source`). Fallback: `/etc/claude-vpn.conf`. |
 | **Machine ID клетки** | `/etc/cld-cage.machine-id` | Уникальный 32-символьный идентификатор клетки для спуфинга `/etc/machine-id`. |
 | **Sudoers** | `/etc/sudoers.d/cld-cage` | NOPASSWD с `Defaults env_reset` и `!use_pty` для `cld-cage`, `celltest`, `cld-probe`. |
@@ -92,7 +92,7 @@ cld-probe --desktop       # Аудит профиля Electron/WebRTC
 cld-probe --cli           # Аудит профиля Claude Code CLI
 cld-probe --json          # JSON вывод отчета
 
-# Административная диагностика (48 тестов)
+# Административная диагностика (53 теста)
 celltest                  # Комплексный тест ядра, nftables, concealment и окружения
 
 # Применение изменений после правок в репозитории

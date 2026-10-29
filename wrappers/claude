@@ -3,13 +3,15 @@
 # Claude Code (CLI) Transparent Wrapper
 # Runs Claude inside the stealth network namespace with Kill Switch
 # ============================================================
-if ip link show enp3s0 >/dev/null 2>&1 || ip link show veth_ns >/dev/null 2>&1; then
+if ip -4 -o addr show dev enp3s0 2>/dev/null | grep -q '10\.200\.1\.2/24' || ip link show veth_ns >/dev/null 2>&1; then
     if [ -x "$HOME/.local/bin/claude-raw" ]; then
         exec "$HOME/.local/bin/claude-raw" "$@"
+    elif [ -x "$HOME/.local/bin/claude" ] && ! grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
+        exec "$HOME/.local/bin/claude" "$@"
     elif [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
         exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
     else
-        echo "Error: raw claude binary not found (expected ~/.local/bin/claude-raw)" >&2
+        echo "Error: raw claude binary not found (expected ~/.local/bin/claude-raw or ~/.local/bin/claude)" >&2
         exit 127
     fi
 fi

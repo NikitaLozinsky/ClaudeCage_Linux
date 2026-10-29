@@ -1,5 +1,5 @@
 # ============================================================
-# ClaudeCage v3.0 Configuration File
+# ClaudeCage v3.1 Configuration File
 #
 # КРИТИЧНЫЕ ПАРАМЕТРЫ СЕТИ И БЕЗОПАСНОСТИ:
 # Должны задаваться в /etc/cld-cage.conf (владелец: root:root, 0644).
@@ -21,4 +21,4 @@ VPN_PROBE="1.1.1.1"
 CLD_TZ="Europe/Amsterdam"
 
 # Путь к локальному репозиторию ClaudeCage для сокрытия от ИИ-агента внутри песочницы
-CAGE_REPO_DIR="/home/milk13/.ClaudeCage_Linux"
+CAGE_REPO_DIR="/home/username/.ClaudeCage_Linux"

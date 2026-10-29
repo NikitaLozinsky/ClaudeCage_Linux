@@ -33,12 +33,16 @@ echo -e "${GREEN}[✓]${NC} Службы systemd остановлены и уд�
 sudo rm -f /usr/local/bin/cld-cage /usr/local/bin/claude-vpn
 sudo rm -f /usr/local/bin/celltest
 sudo rm -f /usr/local/bin/cld-probe /usr/local/bin/claude-probe
-sudo rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn
+sudo rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn /usr/local/lib/xdg-desktop-handler
 sudo rm -f /etc/sudoers.d/cld-cage /etc/sudoers.d/claude-vpn
 echo -e "${GREEN}[✓]${NC} Системные бинарники, библиотеки и sudoers удалены."
 
 # 4. Восстановление пользовательского бинарника claude
 TARGET_USER="${SUDO_USER:-$USER}"
+if [[ "$TARGET_USER" == "root" ]]; then
+    DETECTED_USER=$(find /home -maxdepth 1 -mindepth 1 -type d -not -name "root" -printf "%f\n" 2>/dev/null | head -n1 || echo "")
+    [[ -n "$DETECTED_USER" ]] && TARGET_USER="$DETECTED_USER"
+fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
 [[ -z "$TARGET_HOME" ]] && TARGET_HOME="/home/${TARGET_USER}"
 USER_BIN="${TARGET_HOME}/.local/bin"

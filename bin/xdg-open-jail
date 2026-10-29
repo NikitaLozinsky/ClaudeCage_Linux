@@ -31,7 +31,13 @@ if [ "$copied" = "no" ] && command -v wl-copy >/dev/null 2>&1; then
 fi
 
 # Send desktop notification via proxy if active
-NOTIFY_PROXY="/run/user/$(id -u)/claude_jail_notify.sock"
+NOTIFY_PROXY="/run/user/$(id -u)/dbus-notify-proxy.sock"
+if [ ! -S "$NOTIFY_PROXY" ]; then
+    NOTIFY_PROXY="/run/user/$(id -u)/cld_jail_notify.sock"
+fi
+if [ ! -S "$NOTIFY_PROXY" ]; then
+    NOTIFY_PROXY="/run/user/$(id -u)/claude_jail_notify.sock"
+fi
 if [ -S "$NOTIFY_PROXY" ]; then
     DBUS_SESSION_BUS_ADDRESS="unix:path=$NOTIFY_PROXY" notify-send -u normal \
         "Link Handler" "URL copied to clipboard: $escaped_url" 2>/dev/null || true

@@ -1,7 +1,7 @@
 [Unit]
 Description=ClaudeCage Network Sandbox (Fail-Closed Kill Switch)
 DefaultDependencies=no
-After=local-fs.target
+After=local-fs.target systemd-tmpfiles-setup.service systemd-sysctl.service
 Before=network-pre.target
 Wants=network-pre.target
 Conflicts=shutdown.target

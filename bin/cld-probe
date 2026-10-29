@@ -156,43 +156,55 @@ def probe_egress():
     return results
 
 def probe_host_scan():
+    import concurrent.futures
     ports = [22, 53, 80, 443, 3000, 8080, 5432, 6379, 2375, 11434]
     results = {}
-    for p in ports:
+
+    def _check(p):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.5)
         try:
             s.connect(("10.200.1.1", p))
-            results[str(p)] = "OPEN"
+            return str(p), "OPEN"
         except socket.timeout:
-            results[str(p)] = "DROPPED (Timeout)"
+            return str(p), "DROPPED (Timeout)"
         except ConnectionRefusedError:
-            results[str(p)] = "REFUSED (RST)"
+            return str(p), "REFUSED (RST)"
         except Exception as e:
-            results[str(p)] = f"ERR: {type(e).__name__}"
+            return str(p), f"ERR: {type(e).__name__}"
         finally:
             s.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for p, st in executor.map(_check, ports):
+            results[p] = st
     return results
 
 def probe_rfc1918_scan():
+    import concurrent.futures
     targets = ["192.168.0.40", "192.168.1.1", "172.16.0.1", "10.0.0.1"]
     res = {}
-    for ip in targets:
+
+    def _check(ip):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.3)
         try:
             s.connect((ip, 80))
-            res[ip] = "OPEN"
+            return ip, "OPEN"
         except socket.timeout:
-            res[ip] = "DROPPED (Timeout)"
+            return ip, "DROPPED (Timeout)"
         except ConnectionRefusedError:
-            res[ip] = "REFUSED (RST)"
+            return ip, "REFUSED (RST)"
         except OSError as e:
-            res[ip] = f"BLOCKED ({type(e).__name__})"
+            return ip, f"BLOCKED ({type(e).__name__})"
         except Exception as e:
-            res[ip] = f"ERR: {type(e).__name__}"
+            return ip, f"ERR: {type(e).__name__}"
         finally:
             s.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for ip, st in executor.map(_check, targets):
+            res[ip] = st
     return res
 
 def probe_proc_isolation():
@@ -232,12 +244,15 @@ def probe_proc_isolation():
         pass
 
     mountinfo_has_cld_net = False
+    mountinfo_has_cage_markers = False
     try:
         if os.path.exists("/proc/self/mountinfo"):
             with open("/proc/self/mountinfo") as f:
-                content = f.read()
+                content = f.read().lower()
                 if "/etc/netns/cld_net" in content:
                     mountinfo_has_cld_net = True
+                if any(m in content for m in ["cld-cage", "claude-vpn", "sys-net", "xdg-open-jail"]):
+                    mountinfo_has_cage_markers = True
     except Exception:
         pass
 
@@ -249,12 +264,58 @@ def probe_proc_isolation():
     except Exception:
         pass
 
+    cmdline_leak = False
+    try:
+        import glob
+        self_pid = os.getpid()
+        for cf in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                p_id = int(os.path.basename(os.path.dirname(cf)))
+                if p_id == self_pid:
+                    continue
+                with open(cf, "rb") as f:
+                    cdata = f.read().lower()
+                    if p_id in (1, 2):
+                        parts = cdata.split(b"\0")
+                        sep_idx = parts.index(b"--") if b"--" in parts else len(parts)
+                        prefix = b" ".join(parts[:sep_idx])
+                        if any(bad in prefix for bad in [b"tmpfs", b"overlay", b"ro-bind", b"claudecage", b"cld-cage"]):
+                            cmdline_leak = True
+                            break
+                    else:
+                        if any(m in cdata for m in [b"claudecage", b"cld-cage", b"claude-vpn", b"__claude_tz__", b"\xd1\x81\xd0\xbf\xd1\x83\xd1\x84\xd0\xb8\xd0\xbd\xd0\xb3"]):
+                            cmdline_leak = True
+                            break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    sys_net_enp3s0_address = ""
+    try:
+        if os.path.exists("/sys/class/net/enp3s0/address"):
+            with open("/sys/class/net/enp3s0/address") as f:
+                sys_net_enp3s0_address = f.read().strip()
+    except Exception:
+        pass
+
+    cage_dir_leak = 0
+    try:
+        if os.path.exists("/run/cld-cage"):
+            cage_dir_leak = len(os.listdir("/run/cld-cage"))
+    except Exception:
+        pass
+
     return {
         "proc_1_net_dev": devs,
         "proc_1_net_arp": arp_entries,
         "ru_in_environ": ru_in_environ,
         "mountinfo_has_cld_net": mountinfo_has_cld_net,
-        "machine_id": mid
+        "mountinfo_has_cage_markers": mountinfo_has_cage_markers,
+        "machine_id": mid,
+        "cmdline_leak": cmdline_leak,
+        "sys_net_enp3s0_address": sys_net_enp3s0_address,
+        "cage_dir_leak": cage_dir_leak
     }
 
 def probe_dns():
@@ -353,7 +414,9 @@ def probe_stealth():
         "bin_celltest_visible": os.path.exists("/usr/local/bin/celltest"),
         "bin_cld_probe_visible": os.path.exists("/usr/local/bin/cld-probe") or os.path.exists("/usr/local/bin/claude-probe"),
         "conf_cld_cage_visible": os.path.exists("/etc/cld-cage.conf") or os.path.exists("/etc/claude-vpn.conf"),
-        "systemd_unit_visible": os.path.exists("/etc/systemd/system/cld-cage.service") or os.path.exists("/etc/systemd/system/claude-vpn.service")
+        "systemd_unit_visible": os.path.exists("/etc/systemd/system/cld-cage.service") or os.path.exists("/etc/systemd/system/claude-vpn.service") or os.path.exists("/etc/systemd/system/cld-cage-watchdog.service") or os.path.exists("/etc/systemd/system/claude-vpn-watchdog.service"),
+        "local_bin_wrapper_visible": os.path.exists(os.path.join(home, ".local", "bin", "claude-raw")),
+        "fish_probe_visible": os.path.exists(os.path.join(home, ".config", "fish", "functions", "cld-probe.fish")) or os.path.exists(os.path.join(home, ".config", "fish", "functions", "claude-probe.fish"))
     }
 
 data = {
@@ -438,7 +501,7 @@ class ClaudeProbe:
                 real_macs.add(mac)
             for addr in iface.get("addr_info", []):
                 ip = addr.get("local", "")
-                if ip and not ip.startswith("127.") and not ip.startswith("10.200.1."):
+                if ip and not ip.startswith(("127.", "10.200.1.", "::1", "fe80:")):
                     real_ips.add(ip)
 
         baseline["real_macs"] = list(real_macs)
@@ -489,7 +552,7 @@ class ClaudeProbe:
         if os.geteuid() == 0:
             cmd = [cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
         else:
-            cmd = ["sudo", "-E", cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
+            cmd = ["sudo", cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
 
         try:
             # Запускаем в нейтральном каталоге /tmp, чтобы не вызвать сработку защиты директории
@@ -732,8 +795,9 @@ class ClaudeProbe:
         cage_bin = st.get("bin_cld_cage_visible", False) or st.get("bin_claude_vpn_visible", False)
         celltest_bin = st.get("bin_celltest_visible", False)
         systemd_vis = st.get("systemd_unit_visible", False)
+        local_wrap = st.get("local_bin_wrapper_visible", False) or st.get("fish_probe_visible", False)
         proc_iso = cr.get("proc_isolation", {})
-        has_cld_net_mount = proc_iso.get("mountinfo_has_cld_net", False)
+        has_cld_net_mount = proc_iso.get("mountinfo_has_cld_net", False) or proc_iso.get("mountinfo_has_cage_markers", False)
         cage_mid = proc_iso.get("machine_id", "")
         real_mid = hb.get("real_machine_id", "")
 
@@ -749,14 +813,14 @@ class ClaudeProbe:
             stealth_desc = f"УТЕЧКА: Директория логов клетки содержит {logs_files} доступных файлов!"
             self.score -= 20
             self.vulnerabilities += 1
-        elif cage_bin or celltest_bin or systemd_vis:
+        elif cage_bin or celltest_bin or systemd_vis or local_wrap:
             stealth_status = "WARN"
-            stealth_desc = f"Внимание: Часть служебных бинарников видна в оверлее ФС (cage={cage_bin})"
+            stealth_desc = f"Внимание: Служебные файлы или обёртки видны в ФС клетки (cage={cage_bin}, wrap={local_wrap})"
             self.score -= 10
             self.warnings += 1
         elif has_cld_net_mount:
             stealth_status = "WARN"
-            stealth_desc = "Внимание: /etc/netns/cld_net виден в /proc/self/mountinfo!"
+            stealth_desc = "Внимание: Маркеры клетки обнаружены в /proc/self/mountinfo!"
             self.score -= 10
             self.warnings += 1
         elif cage_mid and real_mid and cage_mid == real_mid:
@@ -764,6 +828,16 @@ class ClaudeProbe:
             stealth_desc = "УТЕЧКА: machine-id в клетке совпадает с реальным machine-id хоста!"
             self.score -= 20
             self.vulnerabilities += 1
+        elif proc_iso.get("cmdline_leak"):
+            stealth_status = "LEAK"
+            stealth_desc = "УТЕЧКА: Текст скрипта или аргументы bwrap видны в /proc/*/cmdline!"
+            self.score -= 20
+            self.vulnerabilities += 1
+        elif proc_iso.get("cage_dir_leak", 0) > 0:
+            stealth_status = "WARN"
+            stealth_desc = "Внимание: В /run/cld-cage видны служебные файлы клетки!"
+            self.score -= 10
+            self.warnings += 1
 
         v.append({
             "vector": "8. Сокрытие факта клетки от Claude",

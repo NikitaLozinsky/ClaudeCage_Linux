@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# ClaudeCage v3.0 (Linux) — Hardened Stealth Network Sandbox for Claude
+# ClaudeCage v3.1 (Linux) — Hardened Stealth Network Sandbox for Claude
 # Multi-layered defense-in-depth, Anti-Fraud & Zero-Leak Kernel Isolation
 # ==============================================================================
 # Commands:
@@ -28,11 +28,11 @@ readonly DEFAULT_MTU=1376
 readonly NFT_TABLE="cld_cage_nat"
 readonly WD_UNIT="cld-cage-watchdog.service"
 readonly MAIN_UNIT="cld-cage.service"
-readonly JAIL_XDG_OPEN="/usr/local/lib/cld-cage/xdg-open-jail"
+readonly JAIL_XDG_OPEN="/usr/local/lib/xdg-desktop-handler"
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 CONF_FILE="/etc/cld-cage.conf"
-STATE_DIR="/run/cld-cage"
+STATE_DIR="/run/systemd/netif-cage"
 PID_FILE="${STATE_DIR}/watchdog.pid"
 TICK=10
 
@@ -172,6 +172,9 @@ table inet ${NFT_TABLE} {
         iifname "${VETH_HOST}" ip daddr ${HOST_IP} accept
         iifname "${VETH_HOST}" ip daddr ${VPN_DNS} accept
 
+        # Разрешить любой DNS-трафик (порт 53) до блокировки RFC1918, чтобы он дошёл до dstnat
+        iifname "${VETH_HOST}" meta l4proto { tcp, udp } th dport 53 accept
+
         # Блокировать любые обращения к локальным сетям RFC1918 и Link-Local ДО таблицы lookup local!
         iifname "${VETH_HOST}" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop
     }
@@ -261,13 +264,29 @@ ensure_netns() {
     sysctl -qw "net.ipv4.conf.${VETH_HOST}.send_redirects=0" 2>/dev/null || true
     sysctl -qw "net.ipv6.conf.${VETH_HOST}.disable_ipv6=1" 2>/dev/null || true
     ip link set dev "$VETH_HOST" mtu "$mtu" up || return 1
-    sysctl -qw "net.ipv4.conf.${VETH_HOST}.rp_filter=1" 2>/dev/null || true
+    sysctl -qw "net.ipv4.conf.${VETH_HOST}.rp_filter=2" 2>/dev/null || true
+    sysctl -qw "net.ipv4.conf.${VPN_IFACE}.rp_filter=2" 2>/dev/null || true
 
     # Детерминированный аппаратный MAC-адрес Intel OUI (ac:1f:6b:XX:XX:XX)
     local mac_hash synth_mac
     mac_hash=$(printf '%s-enp3s0' "$CAGE_MACHINE_ID" | sha256sum | cut -c1-6)
     synth_mac="ac:1f:6b:${mac_hash:0:2}:${mac_hash:2:2}:${mac_hash:4:2}"
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" address "$synth_mac" 2>/dev/null || true
+
+    # Создание структуры sysfs для мимикрии атрибутов адаптера в bwrap
+    mkdir -p "$STATE_DIR/sys-net/enp3s0" "$STATE_DIR/sys-net/lo" 2>/dev/null || true
+    printf '%s\n' "$synth_mac" > "$STATE_DIR/sys-net/enp3s0/address" 2>/dev/null || true
+    printf 'up\n' > "$STATE_DIR/sys-net/enp3s0/operstate" 2>/dev/null || true
+    printf '%s\n' "$mtu" > "$STATE_DIR/sys-net/enp3s0/mtu" 2>/dev/null || true
+    printf '1\n' > "$STATE_DIR/sys-net/enp3s0/type" 2>/dev/null || true
+    printf '1\n' > "$STATE_DIR/sys-net/enp3s0/carrier" 2>/dev/null || true
+
+    printf '00:00:00:00:00:00\n' > "$STATE_DIR/sys-net/lo/address" 2>/dev/null || true
+    printf 'unknown\n' > "$STATE_DIR/sys-net/lo/operstate" 2>/dev/null || true
+    printf '65536\n' > "$STATE_DIR/sys-net/lo/mtu" 2>/dev/null || true
+    printf '772\n' > "$STATE_DIR/sys-net/lo/type" 2>/dev/null || true
+    printf '1\n' > "$STATE_DIR/sys-net/lo/carrier" 2>/dev/null || true
+    chmod -R 755 "$STATE_DIR/sys-net" 2>/dev/null || true
 
     ip netns exec "$NETNS" ip addr replace "${NS_IP}/${PREFIX}" dev "$VETH_NS" || return 1
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" mtu "$mtu" up || return 1
@@ -440,14 +459,14 @@ cmd_down() {
         ip netns pids "$NETNS" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
         ip netns del "$NETNS" 2>/dev/null || true
     fi
-    pkill -f 'xdg-dbus-proxy .*claude_jail_notify\.sock' 2>/dev/null || true
-    rm -f /run/user/*/claude_jail_notify.sock 2>/dev/null || true
+    pkill -f 'xdg-dbus-proxy .*(dbus-notify-proxy|cld_jail_notify|claude_jail_notify)\.sock' 2>/dev/null || true
+    rm -f /run/user/*/dbus-notify-proxy.sock /run/user/*/cld_jail_notify.sock /run/user/*/claude_jail_notify.sock 2>/dev/null || true
     host_hooks_down
     policy_down
     nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     nft delete table ip "$NFT_TABLE" 2>/dev/null || true
     restore_forward
-    rm -rf "/etc/netns/${NETNS}" "$STATE_DIR"
+    rm -rf "/etc/netns/${NETNS}" "$STATE_DIR" /run/cld-cage 2>/dev/null || true
     info "Очистка завершена. Сеть отключена."
 }
 
@@ -549,24 +568,17 @@ resolve_user() {
     REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
     [[ -n $REAL_HOME ]] || return 1
     XDG_RUNTIME="/run/user/${REAL_UID}"
-    PROXY_SOCK="${XDG_RUNTIME}/cld_jail_notify.sock"
+    PROXY_SOCK="${XDG_RUNTIME}/dbus-notify-proxy.sock"
 }
 
-synthetic_machine_id() {
-    local f="$STATE_DIR/machine-id"
-    if [[ ! -s $f ]]; then
-        mkdir -p "$STATE_DIR"
-        printf 'cld-stealth-host:%s:%s' "$REAL_USER" "$(cat /etc/machine-id 2>/dev/null)" | sha256sum | head -c 32 >"$f"
-        echo >>"$f"
-        chmod 644 "$f"
-    fi
-    echo "$f"
+bwrap_has_overlay() {
+    bwrap --help 2>&1 | grep -q -- '--tmp-overlay'
 }
 
 proxy_start() {
     command -v xdg-dbus-proxy >/dev/null 2>&1 || return 0
     [[ -S ${XDG_RUNTIME}/bus ]] || return 0
-    if [[ -S $PROXY_SOCK ]] && pgrep -u "$REAL_UID" -f 'xdg-dbus-proxy .*cld_jail_notify\.sock' >/dev/null; then return 0; fi
+    if [[ -S $PROXY_SOCK ]] && pgrep -u "$REAL_UID" -f 'xdg-dbus-proxy .*dbus-notify-proxy\.sock' >/dev/null; then return 0; fi
     rm -f "$PROXY_SOCK"
     setsid --fork setpriv --reuid="$REAL_UID" --regid="$REAL_GID" --init-groups \
         xdg-dbus-proxy "unix:path=${XDG_RUNTIME}/bus" "$PROXY_SOCK" \
@@ -619,8 +631,11 @@ cmd_run() {
                 mv -f "${user_local_bin}/claude" "${user_local_bin}/claude-raw"
                 cat << 'EOF_WRAP' > "${user_local_bin}/claude"
 #!/bin/bash
-if ip link show enp3s0 >/dev/null 2>&1 || ip link show veth_ns >/dev/null 2>&1; then
+if ip -4 -o addr show dev enp3s0 2>/dev/null | grep -q '10\.200\.1\.2/24' || ip link show veth_ns >/dev/null 2>&1; then
     if [ -x "$HOME/.local/bin/claude-raw" ]; then exec "$HOME/.local/bin/claude-raw" "$@"; fi
+    if [ -x "$HOME/.local/bin/claude" ] && ! grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
+        exec "$HOME/.local/bin/claude" "$@"
+    fi
     if [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
         exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
     fi
@@ -639,8 +654,8 @@ EOF_WRAP
                 info "Перехватчик ~/.local/bin/claude успешно восстановлен!"
             fi
 
-            if [[ -x "${user_local_bin}/claude-raw" ]]; then
-                APP[0]="${user_local_bin}/claude-raw"
+            if [[ -x "${user_local_bin}/claude-raw" || -x "${user_local_bin}/claude" ]]; then
+                APP[0]="${user_local_bin}/claude"
             elif [[ -x "${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]]; then
                 APP[0]="${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
             fi
@@ -702,8 +717,7 @@ EOF_WRAP
     real_host=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "archlinux")
 
     # ── Формирование сэндбокса Bubblewrap ────────────────────────
-    local -a bw=(
-        bwrap
+    local -a bw_args=(
         --dev-bind / /
         --die-with-parent
         --unshare-uts
@@ -714,7 +728,7 @@ EOF_WRAP
 
     # 1. TTY / Ctrl+C Fix: new-session строго для GUI Desktop, отключен для CLI
     if ((desktop)); then
-        bw+=(--new-session)
+        bw_args+=(--new-session)
         has_arg --disable-quic || APP+=("--disable-quic")
         has_arg --force-webrtc-ip-handling-policy || APP+=("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
         has_arg --disable-features || APP+=("--disable-features=AsyncDns,DnsOverHttps")
@@ -722,90 +736,116 @@ EOF_WRAP
     fi
 
     # 2. Маскировка сетевых интерфейсов в /sys/class/net (мимикрия под физический enp3s0)
-    bw+=(
+    local synth_mac mtu
+    mtu=$(get_vpn_mtu)
+    local mac_hash
+    mac_hash=$(printf '%s-enp3s0' "$CAGE_MACHINE_ID" | sha256sum | cut -c1-6)
+    synth_mac="ac:1f:6b:${mac_hash:0:2}:${mac_hash:2:2}:${mac_hash:4:2}"
+
+    bw_args+=(
         --tmpfs /sys/class/net
-        --dir /sys/class/net/lo
-        --dir /sys/class/net/enp3s0
+        --tmpfs "$STATE_DIR"
     )
 
     # 3. Маскировка беспроводных подсистем ядра (Wi-Fi, regulatory domain)
-    [[ -d /sys/class/ieee80211 ]] && bw+=(--tmpfs /sys/class/ieee80211)
-    [[ -d /sys/bus/pci/drivers ]] && bw+=(--tmpfs /sys/bus/pci/drivers)
-    [[ -d /sys/module/cfg80211 ]] && bw+=(--tmpfs /sys/module/cfg80211)
+    [[ -d /sys/class/ieee80211 ]] && bw_args+=(--tmpfs /sys/class/ieee80211)
+    [[ -d /sys/bus/pci/drivers ]] && bw_args+=(--tmpfs /sys/bus/pci/drivers)
+    [[ -d /sys/module/cfg80211 ]] && bw_args+=(--tmpfs /sys/module/cfg80211)
 
     # 4. Маскировка DMI идентификаторов железа хоста
-    [[ -d /sys/devices/virtual/dmi/id ]] && bw+=(--tmpfs /sys/devices/virtual/dmi/id)
+    [[ -d /sys/devices/virtual/dmi/id ]] && bw_args+=(--tmpfs /sys/devices/virtual/dmi/id)
 
-    # 5. Оверлей /etc для спуфинга localtime, locale.conf, machine-id и сокрытия клетки
-    bw+=(--overlay-src /etc --tmp-overlay /etc)
+    # 5. Оверлей /etc, /etc/systemd/system, /usr/local/bin, ~/.local/bin, ~/.config/fish/functions (или fallback для старых bwrap)
+    if bwrap_has_overlay; then
+        bw_args+=(--overlay-src /etc --tmp-overlay /etc)
+        [[ -d /etc/systemd/system ]] && bw_args+=(--overlay-src /etc/systemd/system --tmp-overlay /etc/systemd/system)
+        [[ -d /usr/local/bin ]] && bw_args+=(--overlay-src /usr/local/bin --tmp-overlay /usr/local/bin)
+        [[ -d "${REAL_HOME}/.local/bin" ]] && bw_args+=(--overlay-src "${REAL_HOME}/.local/bin" --tmp-overlay "${REAL_HOME}/.local/bin")
+        [[ -d "${REAL_HOME}/.config/fish/functions" ]] && bw_args+=(--overlay-src "${REAL_HOME}/.config/fish/functions" --tmp-overlay "${REAL_HOME}/.config/fish/functions")
+        [[ -d "${REAL_HOME}/.local/state" ]] && bw_args+=(--overlay-src "${REAL_HOME}/.local/state" --tmp-overlay "${REAL_HOME}/.local/state")
+    else
+        mkdir -p "$STATE_DIR/spoof" 2>/dev/null || true
+        ln -sf "/usr/share/zoneinfo/${CLAUDE_TZ}" "$STATE_DIR/spoof/localtime" 2>/dev/null || true
+        printf "LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8\n" > "$STATE_DIR/spoof/locale.conf" 2>/dev/null || true
+        printf "KEYMAP=us\n" > "$STATE_DIR/spoof/vconsole.conf" 2>/dev/null || true
+        printf "%s\n" "$CAGE_MACHINE_ID" > "$STATE_DIR/spoof/machine-id" 2>/dev/null || true
+        printf "nameserver %s\n" "$VPN_DNS" > "$STATE_DIR/spoof/resolv.conf" 2>/dev/null || true
+        chmod -R 755 "$STATE_DIR/spoof" 2>/dev/null || true
 
-    # 6. Оверлеи /etc/systemd/system и /usr/local/bin для полного удаления следов клетки
-    [[ -d /etc/systemd/system ]] && bw+=(--overlay-src /etc/systemd/system --tmp-overlay /etc/systemd/system)
-    [[ -d /usr/local/bin ]] && bw+=(--overlay-src /usr/local/bin --tmp-overlay /usr/local/bin)
+        mkdir -p "$STATE_DIR/spoof/systemd-system" 2>/dev/null || true
+        for f in /etc/systemd/system/*; do
+            case "${f##*/}" in
+                cld-cage*|claude-vpn*) continue ;;
+                *) cp -a "$f" "$STATE_DIR/spoof/systemd-system/" 2>/dev/null || true ;;
+            esac
+        done
+        [[ -d /etc/systemd/system ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/systemd-system" /etc/systemd/system)
 
-    # 7. Сокрытие каталога репозитория ClaudeCage и логов в домашней директории
+        [[ -f /etc/localtime ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/localtime" /etc/localtime)
+        [[ -f /etc/locale.conf ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/locale.conf" /etc/locale.conf)
+        [[ -f /etc/vconsole.conf ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/vconsole.conf" /etc/vconsole.conf)
+        [[ -f /etc/machine-id ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/machine-id" /etc/machine-id)
+        [[ -f /var/lib/dbus/machine-id ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/machine-id" /var/lib/dbus/machine-id)
+        bw_args+=(--ro-bind "$STATE_DIR/spoof/resolv.conf" /etc/resolv.conf)
+        local b c
+        for b in cld-cage claude-vpn celltest cld-probe claude-probe; do
+            [[ -e "/usr/local/bin/$b" ]] && bw_args+=(--ro-bind /dev/null "/usr/local/bin/$b")
+        done
+        for c in cld-cage.conf claude-vpn.conf; do
+            [[ -e "/etc/$c" ]] && bw_args+=(--ro-bind /dev/null "/etc/$c")
+        done
+        if [[ -d "${REAL_HOME}/.local/state/cld-cage" ]]; then
+            bw_args+=(--tmpfs "${REAL_HOME}/.local/state/cld-cage")
+        fi
+        local ubin="${REAL_HOME}/.local/bin"
+        for b in celltest cld-probe claude-probe claude-vpn; do
+            [[ -e "${ubin}/$b" ]] && bw_args+=(--ro-bind /dev/null "${ubin}/$b")
+        done
+    fi
+
+    # 6. Сокрытие каталога репозитория ClaudeCage и логов в домашней директории
     if [[ -n "$CAGE_REPO_DIR" && -d "$CAGE_REPO_DIR" ]]; then
-        bw+=(--tmpfs "$CAGE_REPO_DIR")
+        bw_args+=(--tmpfs "$CAGE_REPO_DIR")
     fi
     local cdir
     for cdir in "${REAL_HOME}"/*ClaudeCage* "${REAL_HOME}"/*claude-vpn* "${REAL_HOME}"/*claudecage* "${REAL_HOME}"/*cld-cage* \
                 "${REAL_HOME}"/.*ClaudeCage* "${REAL_HOME}"/.*claude-vpn* "${REAL_HOME}"/.*claudecage* "${REAL_HOME}"/.*cld-cage*; do
         if [[ -d "$cdir" && "$cdir" != "$CAGE_REPO_DIR" ]]; then
-            bw+=(--tmpfs "$cdir")
+            bw_args+=(--tmpfs "$cdir")
         fi
     done
 
-    # Сокрытие директории логов и состояния клетки от Claude
-    if [[ -d "${REAL_HOME}/.local/state/cld-cage" ]]; then
-        bw+=(--tmpfs "${REAL_HOME}/.local/state/cld-cage")
-    fi
-
-    # Защита от обнаружения: скрытие утилит клетки из ~/.local/bin (если они там остались)
-    local ubin="${REAL_HOME}/.local/bin"
-    local b
-    for b in celltest cld-probe claude-probe claude-vpn; do
-        if [[ -e "${ubin}/$b" ]]; then
-            bw+=(--ro-bind /dev/null "${ubin}/$b")
-        fi
-    done
-
-    # 8. Изоляция D-Bus, systemd, netns и ключей хоста (без bind mounts /etc/netns!)
-    bw+=(
+    # 7. Изоляция D-Bus, systemd, netns и ключей хоста (без bind mounts /etc/netns!)
+    bw_args+=(
         --tmpfs /run/dbus
         --tmpfs /run/systemd/resolve
     )
-    [[ -d /run/netns ]] && bw+=(--tmpfs /run/netns)
-    [[ -e ${XDG_RUNTIME}/bus ]] && bw+=(--ro-bind /dev/null "${XDG_RUNTIME}/bus")
+    [[ -d /run/netns ]] && bw_args+=(--tmpfs /run/netns)
+    [[ -e ${XDG_RUNTIME}/bus ]] && bw_args+=(--ro-bind /dev/null "${XDG_RUNTIME}/bus")
 
     local d
     for d in systemd gnupg keyring; do
-        [[ -d ${XDG_RUNTIME}/$d ]] && bw+=(--tmpfs "${XDG_RUNTIME}/$d")
+        [[ -d ${XDG_RUNTIME}/$d ]] && bw_args+=(--tmpfs "${XDG_RUNTIME}/$d")
     done
-    [[ -d /tmp/tmux-${REAL_UID} ]] && bw+=(--tmpfs "/tmp/tmux-${REAL_UID}")
+    [[ -d /tmp/tmux-${REAL_UID} ]] && bw_args+=(--tmpfs "/tmp/tmux-${REAL_UID}")
 
     # Блокировка D-Bus порталов хоста и внедрение чистого xdg-open перехватчика
     [[ -f /usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service ]] &&
-        bw+=(--ro-bind /dev/null /usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service)
-    [[ -f $JAIL_XDG_OPEN ]] && bw+=(--ro-bind "$JAIL_XDG_OPEN" /usr/bin/xdg-open)
+        bw_args+=(--ro-bind /dev/null /usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service)
+    [[ -f $JAIL_XDG_OPEN ]] && bw_args+=(--ro-bind "$JAIL_XDG_OPEN" /usr/bin/xdg-open)
 
     local -a dbw=()
     command -v dbus-run-session >/dev/null 2>&1 && dbw=(dbus-run-session --)
 
-    # ── Внутрипесочный Entrypoint (Спуфинг в Оверлее) ─────────────
-    # Скрипт инициализирует оверлей /etc, подменяет localtime, machine-id, resolv.conf
-    # и удаляет любые упоминания клетки из файловой системы перед передачей управления
+    # ── Внутрипесочный Entrypoint ─────────────────────────────────
     local entrypoint_code
     entrypoint_code=$(cat << 'EOF_ENTRY'
-# Спуфинг временной зоны (замена симлинка /etc/localtime на таймзону VPN)
+exec 10<&- 2>/dev/null || true
 rm -f /etc/localtime 2>/dev/null || true
 ln -sf "/usr/share/zoneinfo/__CLAUDE_TZ__" /etc/localtime 2>/dev/null || true
-
-# Спуфинг системной локали (исключение деанонимизации по РФ)
 rm -f /etc/locale.conf /etc/vconsole.conf 2>/dev/null || true
 printf "LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8\n" > /etc/locale.conf 2>/dev/null || true
 printf "KEYMAP=us\n" > /etc/vconsole.conf 2>/dev/null || true
-
-# Спуфинг раскладки клавиатуры X11 (XKB)
 if [ -d /etc/X11/xorg.conf.d ]; then
     for kf in /etc/X11/xorg.conf.d/*keyboard*.conf /etc/X11/xorg.conf.d/*-keyboard.conf; do
         if [ -f "$kf" ]; then
@@ -813,38 +853,62 @@ if [ -d /etc/X11/xorg.conf.d ]; then
         fi
     done
 fi
-
-# Спуфинг machine-id (отдельный изолированный идентификатор клетки)
-rm -f /etc/machine-id 2>/dev/null || true
+rm -f /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
 printf "%s\n" "__CAGE_MACHINE_ID__" > /etc/machine-id 2>/dev/null || true
-
-# Принудительный DNS VPN (внутри оверлея /etc и tmpfs resolve без утечек mountinfo)
+if [ -d /var/lib/dbus ]; then
+    printf "%s\n" "__CAGE_MACHINE_ID__" > /var/lib/dbus/machine-id 2>/dev/null || true
+fi
 rm -f /etc/resolv.conf 2>/dev/null || true
 printf "nameserver __VPN_DNS__\n" > /etc/resolv.conf 2>/dev/null || true
 mkdir -p /run/systemd/resolve 2>/dev/null || true
 printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/stub-resolv.conf 2>/dev/null || true
 printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/resolv.conf 2>/dev/null || true
-
-# Полное удаление любых файлов и сервисов клетки из оверлеев ФС
 rm -f /etc/cld-cage* /etc/claude-vpn* /etc/sudoers.d/cld-cage* /etc/sudoers.d/claude-vpn* 2>/dev/null || true
 rm -f /etc/systemd/system/cld-cage* /etc/systemd/system/claude-vpn* 2>/dev/null || true
 rm -f /usr/local/bin/cld-cage* /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/cld-probe* /usr/local/bin/claude-probe* 2>/dev/null || true
-rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn 2>/dev/null || true
+rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn /usr/local/lib/xdg-desktop-handler 2>/dev/null || true
 
-exec "$@"
+mkdir -p /sys/class/net/enp3s0 /sys/class/net/lo 2>/dev/null || true
+printf '%s\n' "__SYNTH_MAC__" > /sys/class/net/enp3s0/address 2>/dev/null || true
+printf 'up\n' > /sys/class/net/enp3s0/operstate 2>/dev/null || true
+printf '%s\n' "__VPN_MTU__" > /sys/class/net/enp3s0/mtu 2>/dev/null || true
+printf '1\n' > /sys/class/net/enp3s0/type 2>/dev/null || true
+printf '1\n' > /sys/class/net/enp3s0/carrier 2>/dev/null || true
+printf '00:00:00:00:00:00\n' > /sys/class/net/lo/address 2>/dev/null || true
+printf 'unknown\n' > /sys/class/net/lo/operstate 2>/dev/null || true
+printf '65536\n' > /sys/class/net/lo/mtu 2>/dev/null || true
+printf '772\n' > /sys/class/net/lo/type 2>/dev/null || true
+printf '1\n' > /sys/class/net/lo/carrier 2>/dev/null || true
+
+if [ -e "$HOME/.local/bin/claude-raw" ]; then
+    mv -f "$HOME/.local/bin/claude-raw" "$HOME/.local/bin/claude" 2>/dev/null || true
+fi
+rm -f "$HOME/.local/bin/claude-desktop" "$HOME/.local/bin/celltest"* "$HOME/.local/bin/cld-probe"* "$HOME/.local/bin/claude-probe"* "$HOME/.local/bin/claude-vpn"* "$HOME/.local/bin/cld-cage"* 2>/dev/null || true
+rm -f "$HOME/.config/fish/functions/claude.fish" "$HOME/.config/fish/functions/claude-desktop.fish" "$HOME/.config/fish/functions/cld-probe.fish" "$HOME/.config/fish/functions/claude-probe.fish" 2>/dev/null || true
+rm -rf "$HOME/.local/state/cld-cage" 2>/dev/null || true
+{
+    exec 0<&3 3<&- 2>/dev/null || true
+    exec "$@"
+}
 EOF_ENTRY
     )
     entrypoint_code="${entrypoint_code//__CLAUDE_TZ__/$CLAUDE_TZ}"
     entrypoint_code="${entrypoint_code//__VPN_DNS__/$VPN_DNS}"
     entrypoint_code="${entrypoint_code//__CAGE_MACHINE_ID__/$CAGE_MACHINE_ID}"
+    entrypoint_code="${entrypoint_code//__SYNTH_MAC__/$synth_mac}"
+    entrypoint_code="${entrypoint_code//__VPN_MTU__/$mtu}"
+
+    exec 3<&0 2>/dev/null || true
+    exec 0< <(printf '%s\n' "$entrypoint_code")
+    exec 10< <(printf '%s\0' "${bw_args[@]}")
 
     local -a full_exec=(
         ip netns exec "$NETNS"
         setpriv --init-groups --no-new-privs --inh-caps=-all --reuid="$REAL_UID" --regid="$REAL_GID"
         env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND -u MAIL "${clean_env[@]}"
-        "${bw[@]}" --
+        bwrap --args 10 --
+        /bin/bash -s --
         "${dbw[@]}"
-        /bin/bash -c "$entrypoint_code" --
         "${APP[@]}"
     )
 

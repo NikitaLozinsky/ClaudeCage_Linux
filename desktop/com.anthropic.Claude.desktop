@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Claude
-Comment=Anthropic Claude Desktop (Jailed in ClaudeCage)
-Exec=/usr/local/bin/cld-cage claude-desktop %u
+Comment=Anthropic Claude Desktop
+Exec=/home/milk13/.local/bin/claude-desktop %u
 Icon=claude-desktop
 Type=Application
 StartupNotify=true

@@ -476,6 +476,99 @@ if ((DO_APP)) && [[ "$netns_active" = true ]]; then
     else
         warn "MAC-адрес $VETH_NS: '$cage_mac' (ожидался вендор Intel ac:1f:6b:...)"
     fi
+
+    # 4.17. Чистота /proc/*/cmdline (защита от детекта через ps aux)
+    cmdline_leak=$(cvpn_exec python3 -c '
+import os, sys
+leak = 0
+try:
+    with open("/proc/1/cmdline", "rb") as f:
+        p1 = f.read().split(b"\0")
+        sep_idx = p1.index(b"--") if b"--" in p1 else len(p1)
+        bwrap_flags = p1[1:sep_idx]
+        for flag in bwrap_flags:
+            if any(bad in flag.lower() for bad in [b"tmpfs", b"overlay", b"ro-bind", b"claudecage", b"cld-cage"]):
+                leak += 1
+except Exception:
+    pass
+
+forbidden = [b"claudecage", b"cld-cage", b"claude-vpn", b"__claude_tz__", "\u0441\u043f\u0443\u0444\u0438\u043d\u0433".encode("utf-8")]
+self_pid = os.getpid()
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    pid = int(entry)
+    if pid == self_pid:
+        continue
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            data = f.read().lower()
+            if pid in (1, 2):
+                parts = data.split(b"\0")
+                py_idx = next((i for i, part in enumerate(parts) if b"python3" in part), len(parts))
+                data = b" ".join(parts[:py_idx])
+            if any(w in data for w in forbidden):
+                leak += 1
+    except Exception:
+        pass
+
+print(leak)
+' 2>/dev/null || echo 0)
+    cmdline_leak=$(echo "$cmdline_leak" | tail -n1 | tr -d '[:space:]')
+    cmdline_leak=${cmdline_leak:-0}
+    if [[ "$cmdline_leak" =~ ^[0-9]+$ ]] && [[ "$cmdline_leak" -eq 0 ]]; then
+        pass "Чистота /proc/*/cmdline: аргументы bwrap и текст скрипта скрыты (0 совпадений)"
+    else
+        fail "УТЕЧКА: /proc/*/cmdline содержит маркеры клетки ($cmdline_leak совпадений)!"
+    fi
+
+    # 4.18. Доступность /sys/class/net/enp3s0/address и сокрытие state-директории внутри bwrap
+    bwrap_mac=$(cvpn_exec cat /sys/class/net/enp3s0/address 2>/dev/null || echo "")
+    bwrap_mac=$(echo "$bwrap_mac" | tail -n1 | tr -d '[:space:]')
+    cage_dir_leak=$(cvpn_exec /bin/bash -c '([ -d /run/cld-cage ] && ls -A /run/cld-cage 2>/dev/null | wc -l) || ([ -d /run/systemd/netif-cage ] && ls -A /run/systemd/netif-cage 2>/dev/null | wc -l) || echo 0')
+    cage_dir_leak=$(echo "$cage_dir_leak" | tail -n1 | tr -d '[:space:]')
+    cage_dir_leak=${cage_dir_leak:-0}
+    if [[ "$bwrap_mac" =~ ^ac:1f:6b:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$ ]] && [[ "$cage_dir_leak" -eq 0 ]]; then
+        pass "Атрибуты /sys/class/net/enp3s0 доступны внутри bwrap ($bwrap_mac, state-директория скрыта)"
+    else
+        fail "УТЕЧКА / ОШИБКА: Некорректные sysfs атрибуты enp3s0 внутри bwrap (mac: '$bwrap_mac', leak: $cage_dir_leak)"
+    fi
+
+    # 4.19. Чистота ~/.local/bin и ~/.config/fish/functions внутри песочницы
+    local_bin_leak=$(cvpn_exec /bin/bash -c '
+        leak=0
+        [ -e "$HOME/.local/bin/claude-raw" ] && leak=$((leak + 1))
+        [ -e "$HOME/.config/fish/functions/cld-probe.fish" ] && leak=$((leak + 1))
+        kw_leaks=$(grep -Eia "cld-cage|ClaudeCage" "$HOME/.local/bin/"* "$HOME/.config/fish/functions/"* 2>/dev/null | wc -l || echo 0)
+        echo "$((leak + kw_leaks))"
+    ' 2>/dev/null || echo 0)
+    local_bin_leak=$(echo "$local_bin_leak" | tail -n1 | tr -d '[:space:]')
+    local_bin_leak=${local_bin_leak:-0}
+    if [[ "$local_bin_leak" -eq 0 ]]; then
+        pass "Чистота ~/.local/bin и fish: обёртки скрыты, claude переименован без маркеров клетки"
+    else
+        fail "УТЕЧКА: В ~/.local/bin или fish найдены следы клетки ($local_bin_leak совпадений)!"
+    fi
+
+    # 4.20. Отсутствие маркеров cld-cage, sys-net и xdg-open-jail в /proc/self/mountinfo
+    mount_cage_leak=$(cvpn_exec /bin/bash -c 'grep -Eia "cld-cage|claude-vpn|sys-net|xdg-open-jail" /proc/self/mountinfo 2>/dev/null | wc -l || echo 0')
+    mount_cage_leak=$(echo "$mount_cage_leak" | tail -n1 | tr -d '[:space:]')
+    mount_cage_leak=${mount_cage_leak:-0}
+    if [[ "$mount_cage_leak" -eq 0 ]]; then
+        pass "Чистота /proc/self/mountinfo: маркеры cld-cage, sys-net и xdg-open-jail отсутствуют"
+    else
+        fail "УТЕЧКА: В /proc/self/mountinfo обнаружены маркеры клетки ($mount_cage_leak строк)!"
+    fi
+
+    # 4.21. Отсутствие сокетов со словом jail или cld в /run/user/$REAL_UID
+    sock_jail_leak=$(cvpn_exec /bin/bash -c 'find "/run/user/$(id -u)" -maxdepth 1 \( -name "*jail*" -o -name "*cld*" \) 2>/dev/null | wc -l || echo 0')
+    sock_jail_leak=$(echo "$sock_jail_leak" | tail -n1 | tr -d '[:space:]')
+    sock_jail_leak=${sock_jail_leak:-0}
+    if [[ "$sock_jail_leak" -eq 0 ]]; then
+        pass "Сокеты в /run/user: маркеры 'jail' и 'cld' отсутствуют (нейтральный dbus proxy)"
+    else
+        fail "УТЕЧКА: В /run/user найдены подозрительные сокеты ($sock_jail_leak шт.)!"
+    fi
 else
     skip "Тесты сокрытия пропущены (--no-app или netns не активен)"
 fi
