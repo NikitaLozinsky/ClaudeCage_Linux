@@ -46,7 +46,7 @@ fi
 [[ -x "$CVPN" ]] || { echo "Ошибка: не найден бинарник cld-cage!" >&2; exit 2; }
 
 # Считывание параметров из cld-cage
-VPN_IFACE="amn0" VPN_DNS="100.64.0.1" VPN_PROBE="1.1.1.1" CLD_TZ="Europe/Amsterdam" CLAUDE_TZ="Europe/Amsterdam"
+VPN_IFACE="amn0" VPN_DNS="auto" VPN_PROBE="1.1.1.1" CLD_TZ="auto" CLAUDE_TZ="auto"
 CAGE_REPO_DIR="" NETNS="cld_net" VETH_HOST="veth_host" VETH_NS="veth_ns"
 HOST_IP="10.200.1.1" NS_IP="10.200.1.2" RT_TABLE=200 RT_PRIO=100 NFT_TABLE="cld_cage_nat" TICK=10
 
@@ -306,9 +306,13 @@ fi
 header "4. Невидимость и Сокрытие Клетки от ИИ-Агента"
 
 if ((DO_APP)) && [[ "$netns_active" = true ]]; then
-    # 4.1. Сокрытие репозитория ClaudeCage
-    if [[ ! -d "$CAGE_REPO_DIR" && -d "$HOME/.ClaudeCage_Linux" ]]; then
-        CAGE_REPO_DIR="$HOME/.ClaudeCage_Linux"
+    # 4.1. Сокрытие репозитория ClaudeCage / netif-core
+    if [[ ! -d "$CAGE_REPO_DIR" ]]; then
+        if [[ -d "$HOME/.netif-core" ]]; then
+            CAGE_REPO_DIR="$HOME/.netif-core"
+        elif [[ -d "$HOME/.ClaudeCage_Linux" ]]; then
+            CAGE_REPO_DIR="$HOME/.ClaudeCage_Linux"
+        fi
     fi
     repo_leak=$(cvpn_exec /bin/bash -c '
         if [ -d "'"${CAGE_REPO_DIR}"'" ]; then
@@ -554,8 +558,15 @@ print(leak)
     mount_cage_leak=$(cvpn_exec /bin/bash -c 'grep -Eia "cld-cage|claude-vpn|sys-net|xdg-open-jail" /proc/self/mountinfo 2>/dev/null | wc -l || echo 0')
     mount_cage_leak=$(echo "$mount_cage_leak" | tail -n1 | tr -d '[:space:]')
     mount_cage_leak=${mount_cage_leak:-0}
-    if [[ "$mount_cage_leak" -eq 0 ]]; then
-        pass "Чистота /proc/self/mountinfo: маркеры cld-cage, sys-net и xdg-open-jail отсутствуют"
+
+    mount_repo_leak=$(cvpn_exec /bin/bash -c 'grep -Eia "claudecage" /proc/self/mountinfo 2>/dev/null | wc -l || echo 0')
+    mount_repo_leak=$(echo "$mount_repo_leak" | tail -n1 | tr -d '[:space:]')
+    mount_repo_leak=${mount_repo_leak:-0}
+
+    if [[ "$mount_cage_leak" -eq 0 && "$mount_repo_leak" -eq 0 ]]; then
+        pass "Чистота /proc/self/mountinfo: маркеры cld-cage, claudecage, sys-net и xdg-open-jail отсутствуют"
+    elif [[ "$mount_cage_leak" -eq 0 && "$mount_repo_leak" -gt 0 ]]; then
+        warn "Стелс-замечание: В /proc/self/mountinfo обнаружен путь репозитория ($CAGE_REPO_DIR). Для 100% сокрытия переименуйте в ~/.netif-core"
     else
         fail "УТЕЧКА: В /proc/self/mountinfo обнаружены маркеры клетки ($mount_cage_leak строк)!"
     fi
@@ -568,6 +579,21 @@ print(leak)
         pass "Сокеты в /run/user: маркеры 'jail' и 'cld' отсутствуют (нейтральный dbus proxy)"
     else
         fail "УТЕЧКА: В /run/user найдены подозрительные сокеты ($sock_jail_leak шт.)!"
+    fi
+
+    # 4.22. Доступность аудиоподсистемы (PipeWire / PulseAudio для Claude Desktop Voice Mode)
+    audio_sock=$(cvpn_exec /bin/bash -c '
+        uid=$(id -u)
+        if [ -S "/run/user/$uid/pipewire-0" ] || [ -S "/run/user/$uid/pulse/native" ]; then
+            echo "ok"
+        else
+            echo "none"
+        fi
+    ' 2>/dev/null || echo "none")
+    if [[ "$audio_sock" == "ok" ]]; then
+        pass "Аудиоподсистема хоста доступна (PipeWire/PulseAudio сокет проброшен для Voice Mode)"
+    else
+        skip "Сокеты PipeWire/PulseAudio не обнаружены в /run/user/UID (голосовой ввод в Desktop не активен)"
     fi
 else
     skip "Тесты сокрытия пропущены (--no-app или netns не активен)"

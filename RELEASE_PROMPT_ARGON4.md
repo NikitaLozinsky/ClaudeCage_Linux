@@ -6,53 +6,196 @@
 
 ---
 
-## 📌 ВВЕДЕНИЕ И ПОСТАНОВКА ЗАДАЧИ
+## 📌 1. ВВЕДЕНИЕ И ПОСТАНОВКА ЗАДАЧИ
 
-Мы выводим проект **ClaudeCage (Linux)** на официальный релиз (v3.1.0). Проект представляет собой комплексную систему эшелонированной защиты и невидимой изоляции на уровне ядра Linux для **Claude Code (CLI)** и **Claude Desktop (Electron)**.
+Мы выводим проект **ClaudeCage (Linux)** на официальный публичный релиз (v3.1.0). Проект представляет собой комплексную систему эшелонированной защиты и невидимой изоляции на уровне ядра Linux для **Claude Code (CLI)** и **Claude Desktop (Electron)**.
 
-### 🎯 Главная цель проекта:
+### 🎯 Главные цели проекта:
 1. **100% обход антифрод-систем Anthropic** при работе из неподдерживаемых регионов (РФ, Беларусь и др.) без риска блокировки аккаунта.
 2. **Аппаратный Fail-Closed Kill Switch**: нулевая утечка реального IP хоста, DNS, WebRTC или региональных метаданных при любых сетевых сбоях, разрывах VPN или падениях демонов.
 3. **Deep Stealth (Абсолютная невидимость клетки от ИИ-агента)**: Claude Code обладает возможностью исполнять bash-команды (`ls`, `ps`, `cat`, `ip`, `find`). Агент **не должен догадаться**, что он запущен внутри песочницы или клетки:
    - Естественный hostname хоста (без маркеров вроде `jail`, `sandbox`).
-   - Репозиторий проекта перенесён в скрытую директорию `~/.ClaudeCage_Linux` (не отображается в стандартном `ls ~`).
-   - Внутри Bubblewrap каталог репозитория и директория логов монтируются как пустые `tmpfs` (0 файлов).
+   - Нейтральный путь каталога репозитория `~/.netif-core` (полное отсутствие слова `ClaudeCage` в `/proc/self/mountinfo`, `ps aux` и путях монтирования).
+   - Внутри Bubblewrap каталог репозитория и директория логов монтируются как пустые `tmpfs` (0 файлов), при этом пустые каталоги и сессионные якоря исключаются из монтирования во избежание артефактов в mountinfo.
    - Вспомогательные бинарники (`cld-cage`, `celltest`, `cld-probe`) и службы (`cld-cage.service`, `cld-cage-watchdog.service`) удалены из `/usr/local/bin` и `/etc/systemd/system` (зачищены через оверлей).
    - Каталоги `~/.local/bin`, `~/.config/fish/functions` и `~/.local/state` изолированы через `--tmp-overlay`: внутри клетки бинарник `claude-raw` переименован обратно в `claude`, а обёртки и файлы клетки удалены, благодаря чему в `ps aux` и `/proc/*/cmdline` процесс виден строго как `/home/milk13/.local/bin/claude` (без следов `claude-raw`).
    - Сетевой адаптер мимикрирует под физическую сетевую карту Intel Ethernet (`enp3s0`) с детерминированным аппаратным MAC-адресом Intel OUI (`ac:1f:6b:XX:XX:XX`).
    - Пространство PID (`--unshare-pid --proc /proc`) изолирует процессы хоста, `/proc/1/net/dev`, `/proc/1/net/arp` и русские переменные среды `/proc/*/environ`.
    - Аргументы `bwrap` передаются через дескриптор `--args 10`, а entrypoint-скрипт выполняется через `/bin/bash -s --` с сохранением и восстановлением пользовательского stdin (`exec 0<&3 3<&-`), закрываясь перед `exec "$@"`. Это полностью исключает утечку параметров и текста скрипта в `/proc/*/cmdline` (`ps aux`) и решает проблему `Permission denied` при сбросе привилегий.
-   - Симлинк `/etc/localtime` принудительно перенаправлен на таймзону VPN (`Europe/Amsterdam`), а `/etc/locale.conf` спуфится на `en_US.UTF-8`.
+   - Динамическое авто-определение геолокации и часового пояса выхода VPN (`CLD_TZ="auto"`, поддержка любых стран выхода, например, Singapore `Asia/Singapore` или Netherlands `Europe/Amsterdam`) с кэшированием в `/run/systemd/netif-cage/cached_tz`. Спуфинг `/etc/localtime` и `/etc/locale.conf` (`en_US.UTF-8`).
    - Блокировка QUIC (`UDP 443`) и DoT (`853`) предотвращает обход DNS и зависания MTU.
    - Цепочка `prerouting_filter` с приоритетом `raw` отсекает любые обращения к частным подсетям RFC1918 (`10/8, 172.16/12, 192.168/16, 169.254/16`) **ДО таблицы routing lookup local**, пропуская DNS порт 53 на `dstnat`.
    - Watchdog демон слушает Netlink-события ядра в реальном времени и при обрыве туннеля мгновенно вызывает `ss -K -tu 'not dst 127.0.0.0/8'`, разрывая внешние сессии, но **сохраняя `127.0.0.1`** (жизненно важно для локальных MCP-серверов).
+   - Поддержка голосового режима Claude Desktop Voice Mode через безопасный проброс сокетов PipeWire / PulseAudio.
+   - Неинтерактивная авторизация GUI (`sudo -n`) с нативными уведомлениями `notify-send -u critical`.
+   - Индикатор статуса для статус-баров (Polybar / Waybar / bspwm): `cld-status` (`🔒 Claude: VPN (SG)`, `🛑 Claude: Isolated`, `⭕ Claude: Off`).
 
 ---
 
-## 🏛️ ТЕКУЩИЕ РЕЗУЛЬТАТЫ ЖИВОЙ ДИАГНОСТИКИ (ARCH LINUX x86_64)
+## 🎯 2. ПРОВЕРКА 3 СЦЕНАРИЕВ С AMNEZIA VPN (amn0) НА ARCH LINUX + X11 + BSPWM
 
-### 1. celltest v3.1 (Комплексный аудит ядра, nftables, watchdog и песочницы):
+| Сценарий | Как отрабатывает ядро Linux и cld-cage | Что видит Claude (Desktop Electron и Code CLI) | Шанс утечки реального IP |
+| :--- | :--- | :--- | :---: |
+| **1. Запуск с включенным Amnezia VPN (amn0)** | Трафик из `cld_net` (`10.200.1.2`) идёт через `veth_host` в таблицу маршрутизации `200`, где висит `default dev amn0 metric 10`. В `nftables` разрешён форвардинг строго `iifname "veth_host" oifname "amn0"` и работает masquerade. При старте `cld-cage` динамически определяет гео-таймзону через `amn0` (например, `Asia/Singapore` при подключении к Сингапуру) и монтирует соответствующий `/etc/localtime`. | Видит обычный Ethernet-интерфейс `enp3s0` с линком (`carrier=1`), интернет работает штатно, внешний IP, STUN и системное время — строго от VPN-сервера выхода. | **0%** |
+| **2. Запуск с выключенным VPN** | `cld-cage` поднимает пространство `cld_net`, но `vpn_is_up` возвращает `false`. В таблице 200 остаётся только fallback-маршрут `unreachable default metric 9999`, а в `nftables` правило `oifname != "amn0" drop` блокирует любые пакеты мимо туннеля. | Приложение спокойно запускается (локальный интерфейс `enp3s0` поднят, `127.0.0.1` для MCP-серверов работает). При любой попытке выйти в сеть ядро мгновенно возвращает `ENETUNREACH` (Network is unreachable). | **0%** |
+| **3. VPN отвалился или переподключается на ходу** | **1. За 0 мс (в момент падения amn0):** ядро Linux автоматически удаляет маршрут `dev amn0` из таблицы 200. Следующий же пакет упирается в `unreachable default` И одновременно режется правилом `nftables` (`oifname != "amn0" drop`), которое стоит **строго выше** `ct state established`. Пакет физически не может уйти в `wlan0`/`eth0`.<br><br>**2. За <50 мс (Netlink Watchdog):** демон ловит событие `ip monitor`, вызывает `ss -K -tu 'not dst 127.0.0.0/8'` (убивая повисшие TCP/UDP-сокеты прямо внутри клетки с сохранением `127.0.0.1`) и чистит таблицу `conntrack -D -s 10.200.1.2`. | Для Claude это выглядит так, будто у провайдера за маршрутизатором пропал линк: локальная сетевая карта `enp3s0` не пропадает и не мигает, но текущие соединения обрываются по Reset/Timeout, а новые получают `Network is unreachable`. Когда Amnezia переподключится, доступ восстановится автоматически. | **0% (даже на 1 пакет)** |
+
+---
+
+## 🛠️ 3. ПЕРЕЧЕНЬ УСТРАНЁННЫХ ЗАМЕЧАНИЙ И УЛУЧШЕНИЙ В РЕЛИЗЕ v3.1.0
+
+В процессе подготовки релиза были выявлены и устранены следующие архитектурные нюансы:
+
+1. **[P0 #1] Устранение зависания GUI при запуске без терминала:**
+   - *Проблема:* Обёртка `claude-desktop` вызывала `sudo cld-cage ...`. Если срок sudo-тикета истёк или в системе нет графического агента sudo (polkit/askpass), команда зависала в ожидании ввода пароля в несуществующем TTY.
+   - *Решение:* Добавлен флаг `sudo -n`. При ошибке авторизации обёртка не виснет, а мгновенно отправляет пользователю нативное системное уведомление `notify-send -u critical "ClaudeCage" "Ошибка прав sudoers или сети..."`.
+
+2. **[P0 #2] Полное устранение утечки имени каталога в `/proc/self/mountinfo`:**
+   - *Проблема:* При расположении репозитория в `~/.ClaudeCage_Linux` монтирование `--tmpfs ~/.ClaudeCage_Linux` приводило к появлению строки с именем `ClaudeCage` в точке монтирования `/proc/self/mountinfo`.
+   - *Решение:* Репозиторий перенесён в нейтральный каталог `~/.netif-core`. В `install.sh` добавлен флаг `--stealth` для авто-миграции. В `bin/cld-cage` добавлен умный фильтр: пустые каталоги и сессионные заглушки не монтируются как tmpfs, благодаря чему `/proc/self/mountinfo` остаётся на 100% чистым.
+
+3. **[P0 #3] Исправление порядка монтирования Bubblewrap для Ubuntu 22.04 / Debian 12:**
+   - *Проблема:* В fallback-режиме директива `--tmpfs "$STATE_DIR"` шла перед `--ro-bind "$STATE_DIR/spoof/..."`, что на некоторых версиях `bwrap` приводило к ошибке `No such file or directory`.
+   - *Решение:* Директива `--tmpfs "$STATE_DIR"` перемещена строго ПОСЛЕ всех `--ro-bind` монтирований спуф-файлов.
+
+4. **[P1 #1] Динамическое авто-определение гео-локации и таймзоны VPN (`CLD_TZ="auto"`):**
+   - *Проблема:* Ранее часовой пояс был захардкожен на `Europe/Amsterdam`. При подключении к сингапурскому серверу Amnezia VPN возникало несоответствие между IP (`103.242.74.56`, Сингапур) и временем (`Europe/Amsterdam`).
+   - *Решение:* Реализована функция `detect_vpn_geo`, запрашивающая таймзону выходного узла через интерфейс `$VPN_IFACE` (`ipinfo.io`, `ip-api.com`, `worldtimeapi.org`) с мгновенным кэшированием в `/run/systemd/netif-cage/cached_tz`. При переключении серверов таймзона обновляется автоматически. Также внедрено `VPN_DNS="auto"`.
+
+5. **[P1 #2] Поддержка голосового режима Claude Desktop (PipeWire / PulseAudio):**
+   - *Проблема:* В изолированной песочнице отсутствовал доступ к микрофону, что ломало Voice Mode в Claude Desktop.
+   - *Решение:* Реализован безопасный проброс аудио-сокетов (`$XDG_RUNTIME_DIR/pulse/native` и `$XDG_RUNTIME_DIR/pipewire-0`) без предоставления доступа к хостовой сети. В `celltest` добавлен тест 4.22.
+
+6. **[P2 #1] Легковесный виджет статуса клетки (`cld-status`):**
+   - *Проблема:* Пользователю bspwm / Polybar / Waybar требовалось наглядное отображение состояния туннеля клетки.
+   - *Решение:* Создан скрипт `wrappers/polybar-status.sh` (устанавливается как `cld-status`), выводящий нейтральный статус (`🔒 Claude: VPN (SG)`, `🛑 Claude: Isolated`, `⭕ Claude: Off`). Все комментарии скрипта очищены от упоминаний ClaudeCage, а при входе в клетку бинарник скрывается.
+
+---
+
+## 🏛️ 4. ТЕКУЩИЕ РЕЗУЛЬТАТЫ ЖИВОЙ ДИАГНОСТИКИ (ARCH LINUX x86_64)
+
+### 1. celltest v3.1 (54 глубоких теста ядра, nftables, watchdog и песочницы):
 ```text
-Проверено тестов: 53 | Ошибок: 0 | Предупреждений: 0 | Пропущено: 0
-[✓] СИСТЕМА НЕУЯЗВИМА: НУЛЕВАЯ УТЕЧКА ДАННЫХ И ПОЛНАЯ НЕВИДИМОСТЬ (53/53 PASS)
+╔══════════════════════════════════════════════════════════════════╗
+║       CELLTEST v3.1: Комплексный аудит защиты и невидимости      ║
+╚══════════════════════════════════════════════════════════════════╝
+
+━━━ 1. Ядро Linux и Сетевой Namespace (Netns) ━━━
+  ✔ Сетевое пространство (netns) 'cld_net' создано в ядре
+  ✔ Интерфейс veth_host на хосте активен (10.200.1.1)
+  ✔ Фильтрация обратного пути (rp_filter=2) на veth_host
+  ✔ IPv6 на хостовом конце veth_host отключён (disable_ipv6=1)
+  ✔ Интерфейс enp3s0 внутри netns активен (10.200.1.2)
+  ✔ IPv6 внутри клетки полностью отключён (0 утечек через IPv6 SLAAC)
+  ✔ Служба Watchdog активна (systemd: cld-cage-watchdog.service)
+
+━━━ 2. Двухуровневый Fail-Closed Kill Switch ━━━
+  ✔ VPN интерфейс (amn0) активен: 100.77.81.199/32
+  ✔ Policy Routing rule активно (iif veth_host lookup 200, prio 100)
+  ✔ Fail-Closed fallback маршрут активен (unreachable default table 200)
+  ✔ Маршрут egress через VPN активен в table 200 (dev amn0 metric 10)
+  ✔ Таблица nftables 'inet cld_cage_nat' загружена в ядре
+  ✔ Аппаратный Kill Switch активен (DROP выше conntrack established)
+  ✔ Счётчик Kill Switch: packets 0 bytes 0
+  ✔ Защита от подмены IP активна (iifname veth_host ip saddr != 10.200.1.2 drop)
+  ✔ Динамический MSS Clamping активен (tcp option maxseg size set rt mtu)
+  ✔ Фильтр RFC1918 активен в prerouting_filter (блокировка ДО lookup local)
+  ✔ Блокировка QUIC (UDP 443) и DoT (853) активна (принудительный откат на TCP/DNS)
+  ✔ Изоляция локальных портов хоста активна (iifname veth_host drop)
+
+━━━ 3. Антифрод и Нулевая Утечка Региона (РФ / IP) ━━━
+  ✔ Симлинк /etc/localtime внутри клетки указывает на Asia/Singapore (совпадает с VPN)
+  ✔ Node.js Intl.DateTimeFormat().resolvedOptions().timeZone: Asia/Singapore
+  ✔ /etc/locale.conf внутри клетки экранирован (en_US.UTF-8, без признаков РФ)
+  ✔ Переменная среды LANG внутри клетки: en_US.UTF-8
+  ✔ Внешний Egress IP клетки: 103.242.74.56 (маршрутизируется через amn0)
+
+━━━ 4. Невидимость и Сокрытие Клетки от ИИ-Агента ━━━
+  ✔ Каталог ClaudeCage (/home/milk13/.netif-core) полностью скрыт (пустой tmpfs)
+  ✔ Бинарники cld-cage / claude-vpn скрыты из файловой системы песочницы
+  ✔ Конфигурационные файлы cld-cage.conf скрыты из песочницы
+  ✔ Службы systemd клетки скрыты из /etc/systemd/system
+  ✔ Директория логов (~/.local/state/cld-cage) скрыта (пустой tmpfs, 0 файлов)
+  ✔ Утилиты клетки в ~/.local/bin полностью скрыты или очищены
+  ✔ /sys/class/net содержит строго 'lo' и 'enp3s0' (физический Ethernet-адаптер)
+  ✔ Имя хоста внутри клетки естественное: 'archarnel' (без подозрительных меток 'jail')
+  ✔ Атрибут NoNewPrivs=1 активен (блокирует SUID/LPE побег из клетки)
+  ✔ Хостовая сессионная шина D-Bus (/run/user/UID/bus) замаскирована
+  ✔ Изоляция /proc/1/net/dev: сетевые интерфейсы хоста (wlan0, amn0) скрыты
+  ✔ Изоляция /proc/*/environ: утечек русской локали хоста нет (0 совпадений ru_RU)
+  ✔ Спуфинг /etc/machine-id: уникальный ID клетки (f5af993be8c9deaf90cae299f2731153, изолирован от хоста)
+  ✔ Чистота /proc/self/mountinfo: пути /etc/netns/cld_net отсутствуют
+  ✔ Беспроводные подсистемы /sys/class/ieee80211 замаскированы (0 утечек Wi-Fi)
+  ✔ Аппаратный MAC интерфейса enp3s0: ac:1f:6b:ec:c0:af (Intel OUI ac:1f:6b)
+  ✔ Чистота /proc/*/cmdline: аргументы bwrap и текст скрипта скрыты (0 совпадений)
+  ✔ Атрибуты /sys/class/net/enp3s0 доступны внутри bwrap (ac:1f:6b:ec:c0:af, state-директория скрыта)
+  ✔ Чистота ~/.local/bin и fish: обёртки скрыты, claude переименован без маркеров клетки
+  ✔ Чистота /proc/self/mountinfo: маркеры cld-cage, claudecage, sys-net и xdg-open-jail отсутствуют
+  ✔ Сокеты в /run/user: маркеры 'jail' и 'cld' отсутствуют (нейтральный dbus proxy)
+  ✔ Аудиоподсистема хоста доступна (PipeWire/PulseAudio сокет проброшен для Voice Mode)
+
+━━━ 5. DNS Изоляция и Перехват DNAT ━━━
+  ✔ DNS внутри клетки указывает только на 100.64.0.1 (изолированный резолвер VPN)
+  ✔ Принудительный DNAT порт 53 -> 100.64.0.1 активен в nftables prerouting
+  ✔ DNS резолв api.anthropic.com через VPN-туннель: РАБОТАЕТ
+
+━━━ 6. Сокеты и Гигиена Соединений (Loopback Preservation) ━━━
+  ✔ Локальный сокет 127.0.0.1 пережил сброс ss -K (MCP-серверы и IPC не страдают)
+
+━━━ 7. Точки запуска и Защита от Перезаписи ━━━
+  ✔ Fish-функция 'claude' настроена
+  ✔ Fish-функция 'claude-desktop' настроена
+  ✔ Обёртка CLI ~/.local/bin/claude активна
+  ✔ Обёртка GUI ~/.local/bin/claude-desktop активна
+
+━━━ Итоговый результат аудита ━━━
+Проверено тестов: 54 | Ошибок: 0 | Предупреждений: 0 | Пропущено: 0
+
+╔══════════════════════════════════════════════════════════════════╗
+║ [✓] СИСТЕМА НЕУЯЗВИМА: НУЛЕВАЯ УТЕЧКА ДАННЫХ И ПОЛНАЯ НЕВИДИМОСТЬ║
+╚══════════════════════════════════════════════════════════════════╝
 ```
 
 ### 2. cld-probe v1.1-stealth (Аудит 8 векторов атак глазами Claude):
 ```text
-   1. Внешний IP адрес (IPv4/IPv6)    | [БЕЗОПАСНО] | Выход: 89.105.203.114 (IPv6 заблокирован)
-   2. WebRTC IP (STUN через UDP)      | [БЕЗОПАСНО] | STUN Public Reflexive IP: 89.105.203.114:60642
-   3. Физические интерфейсы и MAC     | [БЕЗОПАСНО] | Мимикрия: физический enp3s0 (Intel OUI ac:1f:6b), MAC хоста скрыты
-   4. Сканирование хоста (LAN/SSH)    | [БЕЗОПАСНО] | Все порты хоста и подсети RFC1918 заблокированы (raw drop / Timeout)
-   5. DNS утечки и DNAT перехват      | [БЕЗОПАСНО] | /etc/resolv.conf: nameserver 100.64.0.1
-   6. D-Bus и IPC перехват            | [БЕЗОПАСНО] | Системный D-Bus отключен; пользовательский bus изолирован (/dev/null)
-   7. Геолокация, Таймзона и Локаль   | [БЕЗОПАСНО] | Таймзона: Europe/Amsterdam, Локаль: en_US.UTF-8 (0 ru_RU)
-   8. Сокрытие факта клетки от Claude | [БЕЗОПАСНО] | Репозиторий скрыт (0 файлов); логи изолированы; cmdline чист; mountinfo чист
-Индекс безопасности: 100/100 | Утечек: 0 | Предупреждений: 0 | Вердикт: ПОЛНАЯ ИЗОЛЯЦИЯ: 100% STEALTH
+╔══════════════════════════════════════════════════════════════════╗
+║    CLAUDE-PROBE v1.1-stealth: Network Visibility & Leak Audit Logger     ║
+║         Телеметрия сети и аудит лазеек глазами Claude            ║
+╚══════════════════════════════════════════════════════════════════╝
+Время аудита: 2026-10-30 15:20:00 | Профиль: BOTH | Пользователь: milk13
+
+━━━ 1. Сводная матрица векторов атак и доступных лазеек ━━━
+Вектор атак / Лазейка              | Статус         | Восприятие Claude
+──────────────────────────────────-+-──────────────-+-────────────────────────────────────────
+1. Внешний IP (Egress HTTP/S)      | [БЕЗОПАСНО]    | Внешний IP: 103.242.74.56 (SG, Singapore)
+2. WebRTC STUN UDP-рефлексия       | [БЕЗОПАСНО]    | STUN Public Reflexive IP: 103.242.74.56:54210
+3. Физические интерфейсы и MAC     | [БЕЗОПАСНО]    | Мимикрия: физический enp3s0 (Intel OUI ac:1f:6b), MAC хоста скрыты
+4. Сканирование хоста (LAN/SSH)    | [БЕЗОПАСНО]    | Все порты хоста и подсети RFC1918 заблокированы (raw drop / Timeout)
+5. DNS утечки и DNAT перехват      | [БЕЗОПАСНО]    | /etc/resolv.conf: nameserver 100.64.0.1
+6. D-Bus и IPC перехват            | [БЕЗОПАСНО]    | Системный D-Bus отключен; пользовательский bus изолирован (/dev/null)
+7. Геолокация, Таймзона и Локаль   | [БЕЗОПАСНО]    | Таймзона: Asia/Singapore, Локаль: en_US.UTF-8 (0 ru_RU)
+8. Сокрытие факта клетки от Claude | [БЕЗОПАСНО]    | Репозиторий скрыт (0 файлов); логи изолированы (0 файлов); mountinfo чист; machine-id изолирован
+
+━━━ 2. Сравнение окружения: Реальный Хост vs Клетка Claude ━━━
+  • Видимый IP хоста:    100.77.81.199, 172.27.240.108, ...
+  • Видимый IP в клетке: 103.242.74.56 (Страна: SG, Colo: SIN)
+  • STUN WebRTC IP:      103.242.74.56
+  • Интерфейсы хоста:    4 шт. (wlan0, eth0 и др.)
+  • Интерфейсы в клетке: lo, enp3s0 (мимикрия физического адаптера enp3s0)
+  • Таймзона хоста:      /usr/share/zoneinfo/Europe/Moscow
+  • Таймзона в клетке:   Asia/Singapore (симлинк: /usr/share/zoneinfo/Asia/Singapore)
+  • Доступ к хосту (SSH):DROPPED (Timeout)
+  • Файлы ClaudeCage:    0 файлов (смонтирован пустой tmpfs)
+  • Логи cld-cage:       0 файлов (директория скрыта tmpfs)
+
+━━━ 3. Итоговая оценка защищенности и скрытности ━━━
+  Индекс безопасности: 100/100 | Утечек: 0 | Предупреждений: 0
+  Вердикт: ПОЛНАЯ ИЗОЛЯЦИЯ: 100% STEALTH (Лазейки закрыты, утечек нет)
 ```
 
 ---
 
-## 📂 ПОЛНЫЕ ИСХОДНЫЕ ТЕКСТЫ ВСЕХ ФАЙЛОВ ПРОЕКТА
+## 📂 5. ПОЛНЫЕ ИСХОДНЫЕ ТЕКСТЫ ВСЕХ ФАЙЛОВ ПРОЕКТА
 
 
 ### Файл: `bin/cld-cage`
@@ -98,10 +241,10 @@ TICK=10
 
 # Default configuration values (overridden by /etc/cld-cage.conf or /etc/claude-vpn.conf)
 VPN_IFACE="amn0"
-VPN_DNS="100.64.0.1"
+VPN_DNS="auto"
 VPN_PROBE="1.1.1.1"
-CLAUDE_TZ="Europe/Amsterdam"
-CLD_TZ="Europe/Amsterdam"
+CLAUDE_TZ="auto"
+CLD_TZ="auto"
 CAGE_REPO_DIR=""
 CAGE_MACHINE_ID=""
 
@@ -119,8 +262,8 @@ ensure_cage_machine_id() {
 
 readonly IFACE_RE='^[A-Za-z0-9_.-]{1,15}$'
 readonly OCT='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
-readonly IPV4_RE="^${OCT}\\.${OCT}\\.${OCT}\\.${OCT}\$"
-readonly TZ_RE='^(UTC|[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+)$'
+readonly IPV4_RE="^(${OCT}\\.${OCT}\\.${OCT}\\.${OCT}|auto)\$"
+readonly TZ_RE='^(auto|UTC|[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+)$'
 
 # Output formatting
 if [[ -t 1 && -t 2 ]]; then
@@ -167,10 +310,87 @@ load_config() {
     if [[ -n $v ]]; then [[ $v =~ $TZ_RE ]] || { err "CLD_TZ некорректен: '$v'"; return 1; }; CLD_TZ=$v; CLAUDE_TZ=$v; fi
     v=$(conf_get "$f" CAGE_REPO_DIR)
     if [[ -n $v ]]; then CAGE_REPO_DIR=$v; fi
-    if [[ ! -d "$CAGE_REPO_DIR" && -d "${REAL_HOME:-$HOME}/.ClaudeCage_Linux" ]]; then
-        CAGE_REPO_DIR="${REAL_HOME:-$HOME}/.ClaudeCage_Linux"
+    if [[ ! -d "$CAGE_REPO_DIR" ]]; then
+        if [[ -d "${REAL_HOME:-$HOME}/.netif-core" ]]; then
+            CAGE_REPO_DIR="${REAL_HOME:-$HOME}/.netif-core"
+        elif [[ -d "${REAL_HOME:-$HOME}/.ClaudeCage_Linux" ]]; then
+            CAGE_REPO_DIR="${REAL_HOME:-$HOME}/.ClaudeCage_Linux"
+        fi
     fi
     return 0
+}
+
+# ── Dynamic VPN Geo, Timezone & DNS Resolution ───────────────────
+detect_vpn_geo() {
+    local cur_vip tz="" cc=""
+    cur_vip=$(vpn_ip)
+    if [[ -z "$cur_vip" ]]; then
+        echo "UTC"
+        return 0
+    fi
+
+    # 1. Fast Cache check: if VPN IP has not changed, return cached timezone immediately
+    if [[ -f "$STATE_DIR/cached_tz" && -f "$STATE_DIR/cached_vip" ]]; then
+        if [[ "$(cat "$STATE_DIR/cached_vip" 2>/dev/null)" == "$cur_vip" ]]; then
+            local c_tz
+            c_tz=$(cat "$STATE_DIR/cached_tz" 2>/dev/null)
+            if [[ -n "$c_tz" && -f "/usr/share/zoneinfo/$c_tz" ]]; then
+                echo "$c_tz"
+                return 0
+            fi
+        fi
+    fi
+
+    # 2. Live detection via VPN tunnel interface
+    tz=$(curl -s --interface "$VPN_IFACE" --max-time 3 "https://ipinfo.io/timezone" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$tz" || ! -f "/usr/share/zoneinfo/$tz" ]]; then
+        tz=$(curl -s --interface "$VPN_IFACE" --max-time 3 "http://ip-api.com/line/?fields=timezone" 2>/dev/null | tr -d '[:space:]')
+    fi
+    if [[ -z "$tz" || ! -f "/usr/share/zoneinfo/$tz" ]]; then
+        tz=$(curl -s --interface "$VPN_IFACE" --max-time 3 "http://worldtimeapi.org/api/ip" 2>/dev/null | sed -n 's/.*"timezone":"\([^"]*\)".*/\1/p' | tr -d '[:space:]')
+    fi
+
+    if [[ -n "$tz" && -f "/usr/share/zoneinfo/$tz" ]]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        printf '%s\n' "$tz" > "$STATE_DIR/cached_tz" 2>/dev/null || true
+        printf '%s\n' "$cur_vip" > "$STATE_DIR/cached_vip" 2>/dev/null || true
+        cc=$(curl -s --interface "$VPN_IFACE" --max-time 2 "https://ipinfo.io/country" 2>/dev/null | tr -d '[:space:]' || true)
+        [[ -z "$cc" ]] && cc=$(curl -s --interface "$VPN_IFACE" --max-time 2 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '[:space:]' || true)
+        [[ -n "$cc" ]] && printf '%s\n' "$cc" > "$STATE_DIR/cached_cc" 2>/dev/null || true
+        chmod 0644 "$STATE_DIR"/cached_* 2>/dev/null || true
+        echo "$tz"
+        return 0
+    fi
+
+    if [[ -f "$STATE_DIR/cached_tz" ]]; then
+        cat "$STATE_DIR/cached_tz" 2>/dev/null
+    else
+        echo "UTC"
+    fi
+}
+
+resolve_tz() {
+    if [[ "$CLD_TZ" != "auto" && -n "$CLD_TZ" && "$CLD_TZ" != "UTC" && -f "/usr/share/zoneinfo/$CLD_TZ" ]]; then
+        echo "$CLD_TZ"
+    else
+        detect_vpn_geo
+    fi
+}
+
+resolve_dns() {
+    if [[ "$VPN_DNS" != "auto" && -n "$VPN_DNS" ]]; then
+        echo "$VPN_DNS"
+        return 0
+    fi
+    local d=""
+    if command -v resolvectl >/dev/null 2>&1; then
+        d=$(resolvectl dns "$VPN_IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; exit}}')
+    fi
+    if [[ -n "$d" ]]; then
+        echo "$d"
+    else
+        echo "100.64.0.1"
+    fi
 }
 
 # ── VPN Tunnel Helpers ───────────────────────────────────────────
@@ -283,6 +503,7 @@ EOF
 }
 
 setup_nftables() {
+    VPN_DNS=$(resolve_dns)
     local rules; rules=$(nft_rules)
     nft -c -f - <<<"$rules" || { err "nft: ошибка синтаксиса правил!"; return 1; }
     nft -f - <<<"$rules"    || { err "nft: ядро отклонило транзакцию правил!"; return 1; }
@@ -332,21 +553,6 @@ ensure_netns() {
     mac_hash=$(printf '%s-enp3s0' "$CAGE_MACHINE_ID" | sha256sum | cut -c1-6)
     synth_mac="ac:1f:6b:${mac_hash:0:2}:${mac_hash:2:2}:${mac_hash:4:2}"
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" address "$synth_mac" 2>/dev/null || true
-
-    # Создание структуры sysfs для мимикрии атрибутов адаптера в bwrap
-    mkdir -p "$STATE_DIR/sys-net/enp3s0" "$STATE_DIR/sys-net/lo" 2>/dev/null || true
-    printf '%s\n' "$synth_mac" > "$STATE_DIR/sys-net/enp3s0/address" 2>/dev/null || true
-    printf 'up\n' > "$STATE_DIR/sys-net/enp3s0/operstate" 2>/dev/null || true
-    printf '%s\n' "$mtu" > "$STATE_DIR/sys-net/enp3s0/mtu" 2>/dev/null || true
-    printf '1\n' > "$STATE_DIR/sys-net/enp3s0/type" 2>/dev/null || true
-    printf '1\n' > "$STATE_DIR/sys-net/enp3s0/carrier" 2>/dev/null || true
-
-    printf '00:00:00:00:00:00\n' > "$STATE_DIR/sys-net/lo/address" 2>/dev/null || true
-    printf 'unknown\n' > "$STATE_DIR/sys-net/lo/operstate" 2>/dev/null || true
-    printf '65536\n' > "$STATE_DIR/sys-net/lo/mtu" 2>/dev/null || true
-    printf '772\n' > "$STATE_DIR/sys-net/lo/type" 2>/dev/null || true
-    printf '1\n' > "$STATE_DIR/sys-net/lo/carrier" 2>/dev/null || true
-    chmod -R 755 "$STATE_DIR/sys-net" 2>/dev/null || true
 
     ip netns exec "$NETNS" ip addr replace "${NS_IP}/${PREFIX}" dev "$VETH_NS" || return 1
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" mtu "$mtu" up || return 1
@@ -448,13 +654,17 @@ reconcile_state() {
             ip netns exec "$NETNS" ip link set dev "$VETH_NS" mtu "$m" 2>/dev/null || true
             LAST_MTU=$m
         fi
-        ((flap)) && purge_sockets "флап интерфейса туннеля"
+        if ((flap)); then
+            rm -f "$STATE_DIR/cached_vip" 2>/dev/null || true
+            purge_sockets "флап интерфейса туннеля"
+        fi
         if ((LAST_HEALTH != 1)); then
             info "Туннель $VPN_IFACE здоров, маршрут в table $RT_TABLE активен"
             LAST_HEALTH=1
         fi
     else
         vpn_route_clear
+        rm -f "$STATE_DIR/cached_vip" 2>/dev/null || true
         if ((LAST_HEALTH != 0)); then
             warn "Туннель $VPN_IFACE недоступен: маршрут снят, клетка в fail-closed"
             purge_sockets "туннель отключился"
@@ -496,13 +706,18 @@ cmd_up() {
     need ip nft sysctl
     step "Поднятие изолированного пространства $NETNS"
     save_orig_forward
+    VPN_DNS=$(resolve_dns)
+    CLAUDE_TZ=$(resolve_tz)
     policy_up        || { err "Policy routing не поднялся"; cmd_down; return 1; }
     setup_nftables   || { err "Сбой инициализации nftables"; cmd_down; return 1; }
     host_hooks_up    || warn "Не удалось добавить правила в inet filter forward хоста"
     ensure_netns     || { err "Сбой создания netns/veth"; cmd_down; return 1; }
     if vpn_is_up; then
         vpn_route_set
-        info "Туннель $VPN_IFACE активен, маршрут установлен"
+        local cc; cc=$(cat "$STATE_DIR/cached_cc" 2>/dev/null || echo "")
+        local geo_label="$CLAUDE_TZ"
+        [[ -n "$cc" ]] && geo_label="$CLAUDE_TZ ($cc)"
+        info "Туннель $VPN_IFACE активен, маршрут установлен (Локация: $geo_label, DNS: $VPN_DNS)"
     else
         warn "Туннель $VPN_IFACE не активен: клетка fail-closed (трафик заблокирован)"
     fi
@@ -533,10 +748,16 @@ cmd_down() {
 cmd_status() {
     local ok=0
     echo -e "${C_B}${C_C}=== Статус ClaudeCage (v$VERSION) ===${C_0}"
+    local active_tz active_dns active_cc
+    active_tz=$(resolve_tz)
+    active_dns=$(resolve_dns)
+    active_cc=$(cat "$STATE_DIR/cached_cc" 2>/dev/null || echo "")
     if vpn_is_up; then
-        info "VPN ($VPN_IFACE): ПОДКЛЮЧЁН — $(vpn_ip) (MTU: $(get_vpn_mtu))"
+        local geo_label="$active_tz"
+        [[ -n "$active_cc" ]] && geo_label="$active_tz ($active_cc)"
+        info "VPN ($VPN_IFACE): ПОДКЛЮЧЁН — $(vpn_ip) [Локация: ${geo_label}, DNS: ${active_dns}, MTU: $(get_vpn_mtu)]"
     else
-        warn "VPN ($VPN_IFACE): ОТКЛЮЧЁН (Fail-Closed Kill Switch активен)"
+        warn "VPN ($VPN_IFACE): ОТКЛЮЧЁН (Fail-Closed Kill Switch активен, локация: ${active_tz})"
     fi
     if netns_exists; then
         local pids; pids=$(ip netns pids "$NETNS" 2>/dev/null | wc -l)
@@ -596,12 +817,15 @@ cmd_monitor() {
 }
 
 cmd_print_config() {
+    local active_tz active_dns
+    active_tz=$(resolve_tz)
+    active_dns=$(resolve_dns)
     cat <<EOF
 VPN_IFACE=$VPN_IFACE
-VPN_DNS=$VPN_DNS
+VPN_DNS=$active_dns
 VPN_PROBE=$VPN_PROBE
-CLD_TZ=$CLD_TZ
-CLAUDE_TZ=$CLAUDE_TZ
+CLD_TZ=$active_tz
+CLAUDE_TZ=$active_tz
 CAGE_REPO_DIR=$CAGE_REPO_DIR
 NETNS=$NETNS
 VETH_HOST=$VETH_HOST
@@ -632,7 +856,7 @@ resolve_user() {
 }
 
 bwrap_has_overlay() {
-    bwrap --help 2>&1 | grep -q -- '--tmp-overlay'
+    bwrap --dev-bind / / --overlay-src /etc --tmp-overlay /etc -- true >/dev/null 2>&1
 }
 
 proxy_start() {
@@ -668,6 +892,9 @@ cmd_run() {
     netns_exists || cmd_up || exit 1
     ensure_watchdog
 
+    VPN_DNS=$(resolve_dns)
+    CLAUDE_TZ=$(resolve_tz)
+
     APP=("$@")
     local base=${APP[0]##*/} desktop=0
 
@@ -696,18 +923,30 @@ if ip -4 -o addr show dev enp3s0 2>/dev/null | grep -q '10\.200\.1\.2/24' || ip 
     if [ -x "$HOME/.local/bin/claude" ] && ! grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
         exec "$HOME/.local/bin/claude" "$@"
     fi
-    if [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
-        exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
-    fi
+    for p in \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude" \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js"; do
+        if [ -x "$p" ]; then exec "$p" "$@"; fi
+    done
 fi
 case "$PWD" in
-    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*)
+    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*|*/.netif-core*|*/.netif-core)
         echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
         echo "Перейдите в каталог вашего рабочего проекта." >&2
         exit 1
         ;;
 esac
-exec sudo /usr/local/bin/cld-cage claude "$@"
+if ! sudo -n /usr/local/bin/cld-cage claude "$@"; then
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "Ошибка запуска Claude Code внутри клетки (код $status)." >&2
+        echo "Убедитесь, что настроен /etc/sudoers.d/cld-cage (запустите install.sh)." >&2
+        if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]] && command -v notify-send >/dev/null 2>&1; then
+            notify-send -u critical "ClaudeCage" "Ошибка прав sudoers или сети при запуске Claude Code. Запустите install.sh"
+        fi
+    fi
+    exit $status
+fi
 EOF_WRAP
                 chmod +x "${user_local_bin}/claude"
                 chown "${REAL_USER}:${REAL_USER}" "${user_local_bin}/claude" "${user_local_bin}/claude-raw" 2>/dev/null || true
@@ -716,8 +955,12 @@ EOF_WRAP
 
             if [[ -x "${user_local_bin}/claude-raw" || -x "${user_local_bin}/claude" ]]; then
                 APP[0]="${user_local_bin}/claude"
-            elif [[ -x "${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]]; then
-                APP[0]="${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+            else
+                for p in \
+                    "${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude" \
+                    "${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js"; do
+                    if [[ -x "$p" ]]; then APP[0]="$p"; break; fi
+                done
             fi
             ;;
         claude-desktop)
@@ -747,7 +990,7 @@ EOF_WRAP
     fi
 
     local -a clean_env=(
-        "BROWSER=${JAIL_XDG_OPEN}"
+        "BROWSER=/usr/bin/xdg-open"
         "HOME=${REAL_HOME}"
         "USER=${REAL_USER}"
         "LOGNAME=${REAL_USER}"
@@ -804,7 +1047,6 @@ EOF_WRAP
 
     bw_args+=(
         --tmpfs /sys/class/net
-        --tmpfs "$STATE_DIR"
     )
 
     # 3. Маскировка беспроводных подсистем ядра (Wi-Fi, regulatory domain)
@@ -817,6 +1059,7 @@ EOF_WRAP
 
     # 5. Оверлей /etc, /etc/systemd/system, /usr/local/bin, ~/.local/bin, ~/.config/fish/functions (или fallback для старых bwrap)
     if bwrap_has_overlay; then
+        bw_args+=(--tmpfs "$STATE_DIR")
         bw_args+=(--overlay-src /etc --tmp-overlay /etc)
         [[ -d /etc/systemd/system ]] && bw_args+=(--overlay-src /etc/systemd/system --tmp-overlay /etc/systemd/system)
         [[ -d /usr/local/bin ]] && bw_args+=(--overlay-src /usr/local/bin --tmp-overlay /usr/local/bin)
@@ -848,9 +1091,10 @@ EOF_WRAP
         [[ -f /var/lib/dbus/machine-id ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/machine-id" /var/lib/dbus/machine-id)
         bw_args+=(--ro-bind "$STATE_DIR/spoof/resolv.conf" /etc/resolv.conf)
         local b c
-        for b in cld-cage claude-vpn celltest cld-probe claude-probe; do
+        for b in cld-cage claude-vpn celltest cld-probe claude-probe cld-status; do
             [[ -e "/usr/local/bin/$b" ]] && bw_args+=(--ro-bind /dev/null "/usr/local/bin/$b")
         done
+        [[ -e "$JAIL_XDG_OPEN" ]] && bw_args+=(--ro-bind /dev/null "$JAIL_XDG_OPEN")
         for c in cld-cage.conf claude-vpn.conf; do
             [[ -e "/etc/$c" ]] && bw_args+=(--ro-bind /dev/null "/etc/$c")
         done
@@ -858,9 +1102,12 @@ EOF_WRAP
             bw_args+=(--tmpfs "${REAL_HOME}/.local/state/cld-cage")
         fi
         local ubin="${REAL_HOME}/.local/bin"
-        for b in celltest cld-probe claude-probe claude-vpn; do
+        for b in celltest cld-probe claude-probe claude-vpn cld-status; do
             [[ -e "${ubin}/$b" ]] && bw_args+=(--ro-bind /dev/null "${ubin}/$b")
         done
+
+        # P0 FIX: Маскируем STATE_DIR ТОЛЬКО ПОСЛЕ того, как смонтированы все ro-bind из $STATE_DIR/spoof!
+        bw_args+=(--tmpfs "$STATE_DIR")
     fi
 
     # 6. Сокрытие каталога репозитория ClaudeCage и логов в домашней директории
@@ -871,7 +1118,14 @@ EOF_WRAP
     for cdir in "${REAL_HOME}"/*ClaudeCage* "${REAL_HOME}"/*claude-vpn* "${REAL_HOME}"/*claudecage* "${REAL_HOME}"/*cld-cage* \
                 "${REAL_HOME}"/.*ClaudeCage* "${REAL_HOME}"/.*claude-vpn* "${REAL_HOME}"/.*claudecage* "${REAL_HOME}"/.*cld-cage*; do
         if [[ -d "$cdir" && "$cdir" != "$CAGE_REPO_DIR" ]]; then
-            bw_args+=(--tmpfs "$cdir")
+            # Монтируем tmpfs только если каталог содержит файлы репозитория или .git.
+            # Если это пустой каталог-заглушка или содержит только служебные якоря сессии (.*),
+            # не монтируем tmpfs, чтобы не оставлять следы с именем клетки в /proc/self/mountinfo.
+            local _non_hidden_files
+            _non_hidden_files=$(find "$cdir" -mindepth 1 -maxdepth 2 -not -name ".*" 2>/dev/null | head -n 1)
+            if [[ -n "$_non_hidden_files" || -d "$cdir/.git" ]]; then
+                bw_args+=(--tmpfs "$cdir")
+            fi
         fi
     done
 
@@ -925,7 +1179,7 @@ printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/stub-resolv.conf 2>/dev
 printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/resolv.conf 2>/dev/null || true
 rm -f /etc/cld-cage* /etc/claude-vpn* /etc/sudoers.d/cld-cage* /etc/sudoers.d/claude-vpn* 2>/dev/null || true
 rm -f /etc/systemd/system/cld-cage* /etc/systemd/system/claude-vpn* 2>/dev/null || true
-rm -f /usr/local/bin/cld-cage* /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/cld-probe* /usr/local/bin/claude-probe* 2>/dev/null || true
+rm -f /usr/local/bin/cld-cage* /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/cld-probe* /usr/local/bin/claude-probe* /usr/local/bin/cld-status* 2>/dev/null || true
 rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn /usr/local/lib/xdg-desktop-handler 2>/dev/null || true
 
 mkdir -p /sys/class/net/enp3s0 /sys/class/net/lo 2>/dev/null || true
@@ -942,8 +1196,10 @@ printf '1\n' > /sys/class/net/lo/carrier 2>/dev/null || true
 
 if [ -e "$HOME/.local/bin/claude-raw" ]; then
     mv -f "$HOME/.local/bin/claude-raw" "$HOME/.local/bin/claude" 2>/dev/null || true
+elif grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
+    rm -f "$HOME/.local/bin/claude" 2>/dev/null || true
 fi
-rm -f "$HOME/.local/bin/claude-desktop" "$HOME/.local/bin/celltest"* "$HOME/.local/bin/cld-probe"* "$HOME/.local/bin/claude-probe"* "$HOME/.local/bin/claude-vpn"* "$HOME/.local/bin/cld-cage"* 2>/dev/null || true
+rm -f "$HOME/.local/bin/claude-desktop" "$HOME/.local/bin/celltest"* "$HOME/.local/bin/cld-probe"* "$HOME/.local/bin/claude-probe"* "$HOME/.local/bin/claude-vpn"* "$HOME/.local/bin/cld-cage"* "$HOME/.local/bin/cld-status"* 2>/dev/null || true
 rm -f "$HOME/.config/fish/functions/claude.fish" "$HOME/.config/fish/functions/claude-desktop.fish" "$HOME/.config/fish/functions/cld-probe.fish" "$HOME/.config/fish/functions/claude-probe.fish" 2>/dev/null || true
 rm -rf "$HOME/.local/state/cld-cage" 2>/dev/null || true
 {
@@ -1278,6 +1534,7 @@ def probe_proc_isolation():
 
     mountinfo_has_cld_net = False
     mountinfo_has_cage_markers = False
+    mountinfo_has_repo_name = False
     try:
         if os.path.exists("/proc/self/mountinfo"):
             with open("/proc/self/mountinfo") as f:
@@ -1286,6 +1543,8 @@ def probe_proc_isolation():
                     mountinfo_has_cld_net = True
                 if any(m in content for m in ["cld-cage", "claude-vpn", "sys-net", "xdg-open-jail"]):
                     mountinfo_has_cage_markers = True
+                if "claudecage" in content:
+                    mountinfo_has_repo_name = True
     except Exception:
         pass
 
@@ -1345,6 +1604,7 @@ def probe_proc_isolation():
         "ru_in_environ": ru_in_environ,
         "mountinfo_has_cld_net": mountinfo_has_cld_net,
         "mountinfo_has_cage_markers": mountinfo_has_cage_markers,
+        "mountinfo_has_repo_name": mountinfo_has_repo_name,
         "machine_id": mid,
         "cmdline_leak": cmdline_leak,
         "sys_net_enp3s0_address": sys_net_enp3s0_address,
@@ -1416,6 +1676,7 @@ def probe_stealth():
 
     home = os.environ.get("HOME", "")
     cage_dirs = [
+        os.path.join(home, ".netif-core"),
         os.path.join(home, ".ClaudeCage_Linux"),
         os.path.join(home, "ClaudeCage_Linux"),
         os.path.join(home, ".cld-cage"),
@@ -1426,7 +1687,9 @@ def probe_stealth():
     for cd in cage_dirs:
         if os.path.isdir(cd):
             cage_repo_found = True
-            cnt = len(os.listdir(cd))
+            # Исключаем служебные файлы сессий и якорей агента (.session*)
+            files = [f for f in os.listdir(cd) if not f.startswith(".session")]
+            cnt = len(files)
             if cnt > cage_files_count:
                 cage_files_count = cnt
 
@@ -1580,7 +1843,7 @@ class ClaudeProbe:
             cvpn = "/usr/local/bin/claude-vpn"
         
         env = os.environ.copy()
-        env["SUDO_USER"] = getattr(self, "target_user", "milk13")
+        env["SUDO_USER"] = getattr(self, "target_user", os.environ.get("USER", "user"))
 
         if os.geteuid() == 0:
             cmd = [cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
@@ -1831,11 +2094,14 @@ class ClaudeProbe:
         local_wrap = st.get("local_bin_wrapper_visible", False) or st.get("fish_probe_visible", False)
         proc_iso = cr.get("proc_isolation", {})
         has_cld_net_mount = proc_iso.get("mountinfo_has_cld_net", False) or proc_iso.get("mountinfo_has_cage_markers", False)
+        has_repo_mount = proc_iso.get("mountinfo_has_repo_name", False)
         cage_mid = proc_iso.get("machine_id", "")
         real_mid = hb.get("real_machine_id", "")
 
         stealth_status = "SAFE"
         stealth_desc = f"Репозиторий скрыт ({max(0, cage_files)} файлов); логи изолированы ({logs_files} файлов); mountinfo чист; machine-id изолирован"
+        if has_repo_mount and not has_cld_net_mount:
+            stealth_desc = f"Репозиторий скрыт ({max(0, cage_files)} файлов); логи изолированы; в mountinfo путь ~/.ClaudeCage_Linux (переименуйте в ~/.netif-core для 100% стелса)"
         if cage_files > 0:
             stealth_status = "LEAK"
             stealth_desc = f"УТЕЧКА: ИИ-агент может прочитать {cage_files} файлов репозитория ClaudeCage!"
@@ -2155,7 +2421,7 @@ fi
 [[ -x "$CVPN" ]] || { echo "Ошибка: не найден бинарник cld-cage!" >&2; exit 2; }
 
 # Считывание параметров из cld-cage
-VPN_IFACE="amn0" VPN_DNS="100.64.0.1" VPN_PROBE="1.1.1.1" CLD_TZ="Europe/Amsterdam" CLAUDE_TZ="Europe/Amsterdam"
+VPN_IFACE="amn0" VPN_DNS="auto" VPN_PROBE="1.1.1.1" CLD_TZ="auto" CLAUDE_TZ="auto"
 CAGE_REPO_DIR="" NETNS="cld_net" VETH_HOST="veth_host" VETH_NS="veth_ns"
 HOST_IP="10.200.1.1" NS_IP="10.200.1.2" RT_TABLE=200 RT_PRIO=100 NFT_TABLE="cld_cage_nat" TICK=10
 
@@ -2415,9 +2681,13 @@ fi
 header "4. Невидимость и Сокрытие Клетки от ИИ-Агента"
 
 if ((DO_APP)) && [[ "$netns_active" = true ]]; then
-    # 4.1. Сокрытие репозитория ClaudeCage
-    if [[ ! -d "$CAGE_REPO_DIR" && -d "$HOME/.ClaudeCage_Linux" ]]; then
-        CAGE_REPO_DIR="$HOME/.ClaudeCage_Linux"
+    # 4.1. Сокрытие репозитория ClaudeCage / netif-core
+    if [[ ! -d "$CAGE_REPO_DIR" ]]; then
+        if [[ -d "$HOME/.netif-core" ]]; then
+            CAGE_REPO_DIR="$HOME/.netif-core"
+        elif [[ -d "$HOME/.ClaudeCage_Linux" ]]; then
+            CAGE_REPO_DIR="$HOME/.ClaudeCage_Linux"
+        fi
     fi
     repo_leak=$(cvpn_exec /bin/bash -c '
         if [ -d "'"${CAGE_REPO_DIR}"'" ]; then
@@ -2663,8 +2933,15 @@ print(leak)
     mount_cage_leak=$(cvpn_exec /bin/bash -c 'grep -Eia "cld-cage|claude-vpn|sys-net|xdg-open-jail" /proc/self/mountinfo 2>/dev/null | wc -l || echo 0')
     mount_cage_leak=$(echo "$mount_cage_leak" | tail -n1 | tr -d '[:space:]')
     mount_cage_leak=${mount_cage_leak:-0}
-    if [[ "$mount_cage_leak" -eq 0 ]]; then
-        pass "Чистота /proc/self/mountinfo: маркеры cld-cage, sys-net и xdg-open-jail отсутствуют"
+
+    mount_repo_leak=$(cvpn_exec /bin/bash -c 'grep -Eia "claudecage" /proc/self/mountinfo 2>/dev/null | wc -l || echo 0')
+    mount_repo_leak=$(echo "$mount_repo_leak" | tail -n1 | tr -d '[:space:]')
+    mount_repo_leak=${mount_repo_leak:-0}
+
+    if [[ "$mount_cage_leak" -eq 0 && "$mount_repo_leak" -eq 0 ]]; then
+        pass "Чистота /proc/self/mountinfo: маркеры cld-cage, claudecage, sys-net и xdg-open-jail отсутствуют"
+    elif [[ "$mount_cage_leak" -eq 0 && "$mount_repo_leak" -gt 0 ]]; then
+        warn "Стелс-замечание: В /proc/self/mountinfo обнаружен путь репозитория ($CAGE_REPO_DIR). Для 100% сокрытия переименуйте в ~/.netif-core"
     else
         fail "УТЕЧКА: В /proc/self/mountinfo обнаружены маркеры клетки ($mount_cage_leak строк)!"
     fi
@@ -2677,6 +2954,21 @@ print(leak)
         pass "Сокеты в /run/user: маркеры 'jail' и 'cld' отсутствуют (нейтральный dbus proxy)"
     else
         fail "УТЕЧКА: В /run/user найдены подозрительные сокеты ($sock_jail_leak шт.)!"
+    fi
+
+    # 4.22. Доступность аудиоподсистемы (PipeWire / PulseAudio для Claude Desktop Voice Mode)
+    audio_sock=$(cvpn_exec /bin/bash -c '
+        uid=$(id -u)
+        if [ -S "/run/user/$uid/pipewire-0" ] || [ -S "/run/user/$uid/pulse/native" ]; then
+            echo "ok"
+        else
+            echo "none"
+        fi
+    ' 2>/dev/null || echo "none")
+    if [[ "$audio_sock" == "ok" ]]; then
+        pass "Аудиоподсистема хоста доступна (PipeWire/PulseAudio сокет проброшен для Voice Mode)"
+    else
+        skip "Сокеты PipeWire/PulseAudio не обнаружены в /run/user/UID (голосовой ввод в Desktop не активен)"
     fi
 else
     skip "Тесты сокрытия пропущены (--no-app или netns не активен)"
@@ -2819,7 +3111,7 @@ fi
 
 ### Файл: `bin/xdg-open-jail`
 
-```sh
+```bash
 #!/bin/sh
 # ==============================================================================
 # Desktop URL Handler — Safe Link Forwarder
@@ -2910,6 +3202,18 @@ fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 TARGET_GROUP=$(id -gn "$TARGET_USER")
 
+# Опциональная миграция каталога репозитория в ~/.netif-core для 100% сокрытия в mountinfo
+STEALTH_DEST="${TARGET_HOME}/.netif-core"
+if [[ "${1:-}" == "--migrate-stealth" || "${1:-}" == "--stealth" ]]; then
+    if [[ "$HERE" != "$STEALTH_DEST" ]]; then
+        info "Перемещение репозитория из $HERE в нейтральный каталог $STEALTH_DEST..."
+        mv -T "$HERE" "$STEALTH_DEST"
+        HERE="$STEALTH_DEST"
+        chown -R "${TARGET_USER}:${TARGET_GROUP}" "$STEALTH_DEST" 2>/dev/null || true
+        info "Репозиторий успешно перемещён в $STEALTH_DEST!"
+    fi
+fi
+
 info "Целевой пользователь: ${BOLD}${TARGET_USER}${NC} (Home: ${TARGET_HOME})"
 info "Каталог установки ClaudeCage: ${BOLD}${HERE}${NC}"
 
@@ -2944,7 +3248,7 @@ fi
 
 # 3. Синтаксическая валидация скриптов перед копированием
 step "Валидация синтаксиса скриптов"
-for f in bin/cld-cage bin/celltest bin/xdg-open-jail bin/cld-probe wrappers/claude wrappers/claude-desktop; do
+for f in bin/cld-cage bin/celltest bin/xdg-open-jail bin/cld-probe wrappers/claude wrappers/claude-desktop wrappers/polybar-status.sh; do
     if [[ $f == *.py || $f == *probe ]]; then
         python3 -c "import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())" "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
     else
@@ -3037,7 +3341,7 @@ if [[ ! -f "$SYS_CONF" ]]; then
     sudo sed -i "s|CAGE_REPO_DIR=.*|CAGE_REPO_DIR=\"${HERE}\"|" "$SYS_CONF"
     sudo chown root:root "$SYS_CONF"
     sudo chmod 0644 "$SYS_CONF"
-    info "Создан системный конфиг: $SYS_CONF (интерфейс: $DETECTED_IFACE, репозиторий: $HERE)"
+    info "Создан системный конфиг: $SYS_CONF (интерфейс: $DETECTED_IFACE, таймзона: auto, DNS: auto)"
 else
     # Обновляем путь к репозиторию в существующем конфиге
     if grep -q "CAGE_REPO_DIR" "$SYS_CONF"; then
@@ -3045,7 +3349,18 @@ else
     else
         echo "CAGE_REPO_DIR=\"${HERE}\"" | sudo tee -a "$SYS_CONF" >/dev/null
     fi
+    # Обновляем устаревший хардкод таймзоны Amsterdam на динамический auto
+    if grep -q "Europe/Amsterdam" "$SYS_CONF"; then
+        sudo sed -i 's/CLAUDE_TZ="Europe\/Amsterdam"/CLAUDE_TZ="auto"/g; s/CLD_TZ="Europe\/Amsterdam"/CLD_TZ="auto"/g' "$SYS_CONF"
+        info "Обновлена таймзона в $SYS_CONF: CLD_TZ=\"auto\" (динамическое определение под сервер VPN)"
+    fi
     info "Существующий системный конфиг обновлён ($SYS_CONF)"
+fi
+
+if [[ "$HERE" =~ ClaudeCage|claude-vpn|claudecage ]]; then
+    warn "Каталог репозитория ($HERE) содержит имя ClaudeCage."
+    info "Для 100% сокрытия имени из /proc/self/mountinfo запустите: sudo ./install.sh --stealth"
+    info "(или вручную: mv $HERE ${TARGET_HOME}/.netif-core && cd ${TARGET_HOME}/.netif-core && sudo ./install.sh)"
 fi
 
 # 7. Установка Systemd служб
@@ -3079,6 +3394,16 @@ chmod +x "${USER_BIN}/claude-desktop"
 chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/claude-desktop"
 info "Установлена обёртка GUI: ${USER_BIN}/claude-desktop"
 
+# Индикатор статуса для polybar / bspwm
+if [[ -f "$HERE/wrappers/polybar-status.sh" ]]; then
+    cp -f "$HERE/wrappers/polybar-status.sh" "${USER_BIN}/cld-status.sh"
+    chmod +x "${USER_BIN}/cld-status.sh"
+    chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/cld-status.sh"
+    sudo cp -f "$HERE/wrappers/polybar-status.sh" /usr/local/bin/cld-status
+    sudo chmod 0755 /usr/local/bin/cld-status
+    info "Установлен скрипт статуса для Polybar/bspwm: ${USER_BIN}/cld-status.sh (/usr/local/bin/cld-status)"
+fi
+
 # Диагностическая утилита celltest (устанавливается только в /usr/local/bin для скрытности от клетки)
 sudo cp -f "$HERE/bin/celltest" /usr/local/bin/celltest
 sudo chmod 0755 /usr/local/bin/celltest
@@ -3107,7 +3432,7 @@ if [[ -d "$HERE/desktop" ]]; then
     mkdir -p "$DESKTOP_DIR"
     for dtf in "$HERE/desktop/"*.desktop; do
         if [[ -f "$dtf" ]]; then
-            sed "s|/home/milk13/\.local/bin/claude-desktop|${TARGET_HOME}/.local/bin/claude-desktop|g; s|/usr/local/bin/cld-cage claude-desktop|${TARGET_HOME}/.local/bin/claude-desktop|g" "$dtf" > "${DESKTOP_DIR}/${dtf##*/}"
+            sed "s|^Exec=.*|Exec=${USER_BIN}/claude-desktop %u|g" "$dtf" > "${DESKTOP_DIR}/${dtf##*/}"
         fi
     done
     chown -R "${TARGET_USER}:${TARGET_GROUP}" "$DESKTOP_DIR" 2>/dev/null || true
@@ -3173,7 +3498,7 @@ echo -e "${GREEN}[✓]${NC} Службы systemd остановлены и уд�
 
 # 3. Удаление системных файлов и sudoers
 sudo rm -f /usr/local/bin/cld-cage /usr/local/bin/claude-vpn
-sudo rm -f /usr/local/bin/celltest
+sudo rm -f /usr/local/bin/celltest /usr/local/bin/cld-status
 sudo rm -f /usr/local/bin/cld-probe /usr/local/bin/claude-probe
 sudo rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn /usr/local/lib/xdg-desktop-handler
 sudo rm -f /etc/sudoers.d/cld-cage /etc/sudoers.d/claude-vpn
@@ -3199,7 +3524,7 @@ fi
 rm -f "${USER_BIN}/claude-desktop"
 rm -f "${USER_BIN}/celltest"
 rm -f "${USER_BIN}/cld-probe" "${USER_BIN}/claude-probe"
-rm -f "${USER_BIN}/cld-cage" "${USER_BIN}/claude-vpn"
+rm -f "${USER_BIN}/cld-cage" "${USER_BIN}/claude-vpn" "${USER_BIN}/cld-status.sh"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude.fish"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude-desktop.fish"
 rm -f "${TARGET_HOME}/.config/fish/functions/cld-probe.fish" "${TARGET_HOME}/.config/fish/functions/claude-probe.fish"
@@ -3212,7 +3537,7 @@ echo -e "Примечание: конфигурационные файлы /etc/
 
 ### Файл: `sudoers.d/cld-cage`
 
-```sudoers
+```text
 # ClaudeCage v3.1 NOPASSWD execution for cld-cage orchestrator, celltest and cld-probe
 # Defaults env_reset and !use_pty prevent environment injection, TTY hijacking and LPE vulnerabilities
 Defaults env_reset
@@ -3288,17 +3613,20 @@ WantedBy=multi-user.target
 # Поддерживаются: WireGuard (wg0), OpenVPN (tun0), AmneziaVPN (amn0), ProtonVPN (proton0)
 VPN_IFACE="amn0"
 
-# Целевой DNS-резолвер туннеля (по умолчанию: 100.64.0.1 для Amnezia)
-VPN_DNS="100.64.0.1"
+# Целевой DNS-резолвер туннеля ("auto" для авто-определения через resolvectl туннеля, либо конкретный IP: 100.64.0.1 или 1.1.1.1)
+VPN_DNS="auto"
 
 # Целевой адрес для liveness-пробы watchdog (проверяется строго через туннельный интерфейс)
 VPN_PROBE="1.1.1.1"
 
-# Часовой пояс окружения для антифрода (должен совпадать с геолокацией VPN-сервера выхода)
-CLD_TZ="Europe/Amsterdam"
+# Часовой пояс окружения для антифрода.
+# "auto" (по умолчанию) — автоматически определяет таймзону сервера выхода VPN (Сингапур, Амстердам и т.д.)
+# Также можно зафиксировать статически: "Asia/Singapore", "Europe/Amsterdam", "UTC"
+CLD_TZ="auto"
 
-# Путь к локальному репозиторию ClaudeCage для сокрытия от ИИ-агента внутри песочницы
-CAGE_REPO_DIR="/home/username/.ClaudeCage_Linux"
+# Путь к каталогу репозитория для сокрытия от ИИ-агента внутри песочницы.
+# Рекомендуется нейтральный путь (например, ~/.netif-core), чтобы исключить слова "claude"/"cage" из /proc/self/mountinfo
+CAGE_REPO_DIR="/home/username/.netif-core"
 
 ```
 
@@ -3316,23 +3644,36 @@ if ip -4 -o addr show dev enp3s0 2>/dev/null | grep -q '10\.200\.1\.2/24' || ip 
         exec "$HOME/.local/bin/claude-raw" "$@"
     elif [ -x "$HOME/.local/bin/claude" ] && ! grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
         exec "$HOME/.local/bin/claude" "$@"
-    elif [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
-        exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
-    else
-        echo "Error: raw claude binary not found (expected ~/.local/bin/claude-raw or ~/.local/bin/claude)" >&2
-        exit 127
     fi
+    for p in \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude" \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js" \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"; do
+        if [ -x "$p" ]; then exec "$p" "$@"; fi
+    done
+    echo "Error: raw claude binary not found (expected ~/.local/bin/claude-raw or ~/.local/bin/claude)" >&2
+    exit 127
 fi
 
 case "$PWD" in
-    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*)
+    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*|*/.netif-core*|*/.netif-core)
         echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
         echo "Чтобы агент не обнаружил файлы клетки и факт изоляции, перейдите в ваш рабочий каталог проекта." >&2
         exit 1
         ;;
 esac
 
-exec sudo /usr/local/bin/cld-cage claude "$@"
+if ! sudo -n /usr/local/bin/cld-cage claude "$@"; then
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "Ошибка запуска Claude Code внутри клетки (код $status)." >&2
+        echo "Убедитесь, что настроен /etc/sudoers.d/cld-cage (запустите install.sh)." >&2
+        if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]] && command -v notify-send >/dev/null 2>&1; then
+            notify-send -u critical "ClaudeCage" "Ошибка прав sudoers или сети при запуске Claude Code. Запустите install.sh"
+        fi
+    fi
+    exit $status
+fi
 
 ```
 
@@ -3356,7 +3697,49 @@ if ip -4 -o addr show dev enp3s0 2>/dev/null | grep -q '10\.200\.1\.2/24' || ip 
     fi
 fi
 
-exec sudo /usr/local/bin/cld-cage claude-desktop "$@"
+if ! sudo -n /usr/local/bin/cld-cage claude-desktop "$@"; then
+    status=$?
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "ClaudeCage" "Ошибка запуска Claude Desktop (код $status): проверьте права sudoers в /etc/sudoers.d/cld-cage (запустите install.sh) или статус VPN"
+    fi
+    exit $status
+fi
+
+```
+
+
+### Файл: `wrappers/polybar-status.sh`
+
+```bash
+#!/bin/bash
+# ============================================================
+# Stealth Status Indicator for Polybar / bspwm
+# Usage in polybar config:
+#   [module/cld_status]
+#   type = custom/script
+#   exec = ~/.local/bin/cld-status.sh
+#   interval = 3
+# ============================================================
+set -u
+
+STATE_DIR="/run/systemd/netif-cage"
+
+if ! ip netns list 2>/dev/null | grep -q "^cld_net\b"; then
+    echo "%{F#707880}⭕ Claude: Off%{F-}"
+    exit 0
+fi
+
+# Проверка активного маршрута туннеля в таблице 200
+if ip route show table 200 2>/dev/null | grep -q "^default dev"; then
+    cc=$(cat "$STATE_DIR/cached_cc" 2>/dev/null || echo "")
+    if [[ -z "$cc" && -f "$STATE_DIR/cached_tz" ]]; then
+        cc=$(cat "$STATE_DIR/cached_tz" 2>/dev/null | awk -F/ '{print $NF}')
+    fi
+    [[ -n "$cc" ]] && cc=" ($cc)"
+    echo "%{F#A3BE8C}🔒 Claude: VPN${cc}%{F-}"
+else
+    echo "%{F#BF616A}🛑 Claude: Isolated%{F-}"
+fi
 
 ```
 
@@ -3370,6 +3753,10 @@ function claude --description 'Run Claude Code CLI inside isolated stealth netwo
             exec "$HOME/.local/bin/claude-raw" $argv
         else if test -x "$HOME/.local/bin/claude"; and not grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null
             exec "$HOME/.local/bin/claude" $argv
+        else if test -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude"
+            exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude" $argv
+        else if test -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js" $argv
         else if test -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
             exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" $argv
         else
@@ -3379,13 +3766,19 @@ function claude --description 'Run Claude Code CLI inside isolated stealth netwo
     end
 
     switch "$PWD"
-        case "*ClaudeCage*" "*claude-vpn*" "*claudecage*" "*cld-cage*"
+        case "*ClaudeCage*" "*claude-vpn*" "*claudecage*" "*cld-cage*" "*/.netif-core*" "*/.netif-core"
             echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
             echo "Перейдите в каталог вашего рабочего проекта." >&2
             return 1
     end
 
-    sudo /usr/local/bin/cld-cage claude $argv
+    sudo -n /usr/local/bin/cld-cage claude $argv
+    set -l status_code $status
+    if test $status_code -ne 0
+        echo "Ошибка запуска Claude Code внутри клетки (код $status_code)." >&2
+        echo "Убедитесь, что настроен /etc/sudoers.d/cld-cage (запустите install.sh)." >&2
+        return $status_code
+    end
 end
 
 ```
@@ -3406,7 +3799,14 @@ function claude-desktop --description 'Run Claude Desktop inside isolated stealt
         end
     end
 
-    sudo /usr/local/bin/cld-cage claude-desktop $argv
+    sudo -n /usr/local/bin/cld-cage claude-desktop $argv
+    set -l status_code $status
+    if test $status_code -ne 0
+        if type -q notify-send
+            notify-send -u critical "ClaudeCage" "Ошибка запуска Claude Desktop (код $status_code): проверьте sudoers и VPN"
+        end
+        return $status_code
+    end
 end
 
 ```
@@ -3437,11 +3837,11 @@ end
 
 ### Файл: `desktop/com.anthropic.Claude.desktop`
 
-```desktop
+```ini
 [Desktop Entry]
 Name=Claude
 Comment=Anthropic Claude Desktop
-Exec=/home/milk13/.local/bin/claude-desktop %u
+Exec=claude-desktop %u
 Icon=claude-desktop
 Type=Application
 StartupNotify=true
@@ -3461,7 +3861,7 @@ MimeType=x-scheme-handler/claude;
 [![Platform](https://img.shields.io/badge/Platform-Linux%20(Arch%20%7C%20Debian%20%7C%20Fedora%20%7C%20Ubuntu)-blue.svg?logo=linux)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![Security](https://img.shields.io/badge/Security-Hardened%20Kill%20Switch-success.svg?logo=securityscorecard)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![Stealth](https://img.shields.io/badge/Stealth-Deep%20Stealth%20%2B%20Kernel%20Hardening-orange.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
-[![Diagnostics](https://img.shields.io/badge/Diagnostics-celltest%20v3.1%2053%2F53%20PASS-brightgreen.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
+[![Diagnostics](https://img.shields.io/badge/Diagnostics-celltest%20v3.1%2054%2F54%20PASS-brightgreen.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
@@ -3551,26 +3951,30 @@ flowchart TD
 - **DROP выше conntrack**: Правило сброса `iifname "veth_host" oifname != "$VPN_IFACE" counter drop` расположено **строго выше** `ct state established,related accept`.
 - **Защита от подмены IP (Anti-Spoofing)**: Пакеты с адресом источника, отличным от `10.200.1.2`, сбрасываются.
 - **Динамический MSS Clamping**: Правило `tcp flags syn tcp option maxseg size set rt mtu` динамически подстраивает размер TCP-сегмента под реальный MTU туннеля.
-- **Принудительный DNAT DNS**: Любые DNS-запросы (порт 53 UDP/TCP) принудительно перенаправляются на доверенный резолвер VPN (`100.64.0.1` или настроенный `VPN_DNS`).
+- **Принудительный DNAT DNS**: Любые DNS-запросы (порт 53 UDP/TCP) принудительно перенаправляются на доверенный резолвер VPN (`VPN_DNS="auto"` через `resolvectl dns` или `100.64.0.1`).
 - **Изоляция Input**: Клетка изолирована от локальных портов хоста (`10.200.1.1` и сервисов `localhost`).
 
 ### Эшелон 3: Песочница файловой системы и Стелс-сокрытие (`bubblewrap`)
 - **PID Namespace & Изоляция /proc**: Флаги `--unshare-pid --proc /proc` скрывают процессы хоста, сетевую статистику `/proc/1/net/dev`, `/proc/1/net/arp` и переменные окружения процессов хоста (`/proc/*/environ`).
 - **Безопасный сброс привилегий**: `setpriv` сбрасывает UID/GID до непривилегированного пользователя с очисткой возможностей (`--inh-caps=-all`, `--no-new-privs`) **до** входа в `bwrap`, блокируя любые попытки LPE-побега через `sudo`.
-- **Сокрытие репозитория ClaudeCage**: Каталог репозитория клетки (расположенный в скрытом `~/.ClaudeCage_Linux`), а также директория логов `~/.local/state/cld-cage` монтируются как пустые `tmpfs`.
-- **Сокрытие служебных бинарников и служб**: Файлы `/usr/local/bin/cld-cage`, `/etc/cld-cage.conf`, `/etc/systemd/system/cld-cage*` полностью удалены из файловой системы внутри сэндбокса через оверлеи.
+- **Нейтральный путь репозитория (`~/.netif-core`)**: Репозиторий размещается по нейтральному системному пути `~/.netif-core`, что гарантирует 100% отсутствие имени `ClaudeCage` в `/proc/self/mountinfo`, `ps aux` и путях монтирования.
+- **Умное скрытие tmpfs**: Каталоги репозиториев монтируются как пустые `tmpfs`. Если каталог пуст или является временным якорем сессии, он не монтируется через `bwrap`, исключая появление лишних точек монтирования в `/proc/self/mountinfo`.
+- **Сокрытие служебных бинарников и служб**: Файлы `/usr/local/bin/cld-cage`, `/etc/cld-cage.conf`, `/etc/systemd/system/cld-cage*`, а также обёртки и функции в `~/.local/bin/` и `~/.config/fish/functions/` полностью скрыты из файловой системы песочницы.
 - **Маскировка `/sys/class/net` и беспроводных подсистем**: Внутри песочницы создана чистая виртуальная структура интерфейсов, содержащая только `lo` и `enp3s0`. Подсистемы `/sys/class/ieee80211`, `/sys/bus/pci/drivers` и `/sys/module/cfg80211` замаскированы.
 - **Естественный Hostname**: Hostname внутри песочницы наследует имя реального компьютера хоста (без выдающих песочницу названий вроде `claude-jail`).
 
 ### Эшелон 4: Нулевая утечка геолокации и языка (Anti-Fraud)
-- **Спуфинг `/etc/localtime`**: Внутри временного оверлея `/etc` симлинк `/etc/localtime` перенаправлен на бинарный файл часового пояса туннеля (по умолчанию `Europe/Amsterdam`). Любые системные вызовы и Node.js `Intl.DateTimeFormat` видят европейское время.
+- **Динамическое авто-определение таймзоны (`CLD_TZ="auto"`)**: Клетка автоматически определяет геолокацию и часовой пояс выхода VPN-туннеля (например, `Asia/Singapore` или `Europe/Amsterdam`) через интерфейс `$VPN_IFACE` с кэшированием в `/run/systemd/netif-cage/cached_tz`. Переключение серверов в Amnezia/WireGuard не требует ручной правки конфигов.
+- **Спуфинг `/etc/localtime`**: Внутри временного оверлея `/etc` симлинк `/etc/localtime` указывает на бинарный файл часового пояса туннеля. Node.js `Intl.DateTimeFormat` и системные вызовы видят время страны VPN-выхода.
 - **Спуфинг `/etc/locale.conf`**: Файл принудительно подменён на `LANG=en_US.UTF-8` и `LC_ALL=en_US.UTF-8`. Хостовые русские локали `ru_RU` полностью вычищены.
 - **Спуфинг раскладки**: `/etc/vconsole.conf` подменён на `KEYMAP=us`.
 
-### Эшелон 5: Интерактивный TTY и изоляция D-Bus
+### Эшелон 5: Интерактивный TTY, аудиоподсистема и D-Bus
 - **Полноценный TTY для CLI**: Флаг `--new-session` применяется исключительно для GUI Electron. Для CLI Claude Code сохранён управляющий терминал, что обеспечивает бесперебойную работу сигналов `Ctrl+C` (SIGINT) и job control.
-- **Автономный D-Bus**: Приложение запускается через `dbus-run-session`, поднимая чистую сессионную шину без сервисов хоста.
-- **Перехватчик ссылок (`xdg-desktop-handler`)**: Перехватывает URL, копирует в буфер обмена и отправляет нейтральное уведомление на хост через фильтрованный сокет-прокси `xdg-dbus-proxy` (разрешён только `org.freedesktop.Notifications`).
+- **Поддержка голосового режима (PipeWire / PulseAudio)**: Аудио-сокет (`pulse/native` или `pipewire-0`) безопасно пробрасывается в песочницу, позволяя использовать микрофон и голосовой ввод в Claude Desktop без раскрытия сетевых интерфейсов хоста.
+- **Автономный D-Bus и уведомления**: Приложение запускается через `dbus-run-session`, поднимая чистую сессионную шину без сервисов хоста. Ссылки перехватываются `xdg-desktop-handler` с копированием в буфер обмена и отправкой нейтрального уведомления через `xdg-dbus-proxy`.
+- **Неинтерактивный запуск GUI (`sudo -n`)**: Графическая обёртка `claude-desktop` использует `sudo -n` и при сбое авторизации выдаёт нативное графическое предупреждение через `notify-send -u critical`, исключая зависания без терминала.
+- **Индикатор статуса (`cld-status`)**: Легковесный скрипт для Polybar, Waybar, i3blocks или bspwm, выводящий статус клетки: `🔒 Claude: VPN (SG)`, `🛑 Claude: Isolated`, `⭕ Claude: Off`.
 
 ### Эшелон 6: Systemd Watchdog демон реального времени (Netlink)
 - Фоновый демон оформлен в виде системной службы `cld-cage-watchdog.service` с `KillMode=control-group`.
@@ -3588,20 +3992,29 @@ flowchart TD
 
 ### Установка
 
+Рекомендуется клонировать репозиторий в нейтральный каталог `~/.netif-core` — это гарантирует 100% отсутствие имени `ClaudeCage` в `/proc/self/mountinfo` и процессах:
+
 ```bash
+# Рекомендуемый стелс-вариант установки:
+git clone https://github.com/NikitaLozinsky/ClaudeCage_Linux.git ~/.netif-core
+cd ~/.netif-core
+./install.sh
+
+# Или стандартная установка с автоматической миграцией в стелс-каталог:
 git clone https://github.com/NikitaLozinsky/ClaudeCage_Linux.git
 cd ClaudeCage_Linux
-./install.sh
+./install.sh --stealth
 ```
 
 Инсталлятор в автоматическом режиме:
 1. Проверит наличие всех необходимых зависимостей и синтаксис скриптов.
 2. Установит системный оркестратор `/usr/local/bin/cld-cage` с правами `root:root 0755` (с алиасом `claude-vpn`).
 3. Сконфигурирует безопасный `sudoers` с предварительной валидацией через `visudo -c`.
-4. Автоматически определит активный VPN-интерфейс (`amn0`, `wg0`, `tun0`, `proton0`).
+4. Автоматически определит активный VPN-интерфейс (`amn0`, `wg0`, `tun0`, `proton0`) и часовой пояс выхода.
 5. Установит systemd-службы `cld-cage.service` и `cld-cage-watchdog.service`.
-6. Настроит прозрачные обёртки в `~/.local/bin/` с защитой от запуска внутри репозитория клетки.
-7. Интегрирует Fish-функции и меню приложений.
+6. Настроит прозрачные обёртки в `~/.local/bin/` (CLI `claude`, GUI `claude-desktop`) с защитой от запуска внутри репозитория клетки.
+7. Установит индикатор статуса `cld-status` для Polybar/Waybar/bspwm.
+8. Интегрирует Fish-функции и меню приложений (.desktop).
 
 ---
 
@@ -3650,7 +4063,7 @@ celltest
   ✔ Внешний Egress IP клетки: 89.105.203.114 (маршрутизируется через amn0)
 
 ━━━ 4. Невидимость и Сокрытие Клетки от ИИ-Агента ━━━
-  ✔ Каталог ClaudeCage (/home/milk13/.ClaudeCage_Linux) полностью скрыт (пустой tmpfs)
+  ✔ Каталог ClaudeCage (/home/milk13/.netif-core) полностью скрыт (пустой tmpfs)
   ✔ Бинарники cld-cage / claude-vpn скрыты из файловой системы песочницы
   ✔ Конфигурационные файлы cld-cage.conf скрыты из песочницы
   ✔ Службы systemd клетки скрыты из /etc/systemd/system
@@ -3667,7 +4080,11 @@ celltest
   ✔ Беспроводные подсистемы /sys/class/ieee80211 замаскированы (0 утечек Wi-Fi)
   ✔ Аппаратный MAC интерфейса enp3s0: ac:1f:6b:ec:c0:af (Intel OUI ac:1f:6b)
   ✔ Чистота /proc/*/cmdline: аргументы bwrap и текст скрипта скрыты (0 совпадений)
-  ✔ Атрибуты /sys/class/net/enp3s0 доступны внутри bwrap (ac:1f:6b:..., /run/cld-cage скрыт)
+  ✔ Атрибуты /sys/class/net/enp3s0 доступны внутри bwrap (ac:1f:6b:..., state-директория скрыта)
+  ✔ Чистота ~/.local/bin и fish: обёртки скрыты, claude переименован без маркеров клетки
+  ✔ Чистота /proc/self/mountinfo: маркеры cld-cage, claudecage, sys-net и xdg-open-jail отсутствуют
+  ✔ Сокеты в /run/user: маркеры 'jail' и 'cld' отсутствуют (нейтральный dbus proxy)
+  ✔ Аудиоподсистема хоста доступна (PipeWire/PulseAudio сокет проброшен для Voice Mode)
 
 ━━━ 5. DNS Изоляция и Перехват DNAT ━━━
   ✔ DNS внутри клетки указывает только на 100.64.0.1 (изолированный резолвер VPN)
@@ -3684,7 +4101,7 @@ celltest
   ✔ Обёртка GUI ~/.local/bin/claude-desktop активна
 
 ━━━ Итоговый результат аудита ━━━
-Проверено тестов: 53 | Ошибок: 0 | Предупреждений: 0 | Пропущено: 0
+Проверено тестов: 54 | Ошибок: 0 | Предупреждений: 0 | Пропущено: 0
 
 ╔══════════════════════════════════════════════════════════════════╗
 ║ [✓] СИСТЕМА НЕУЯЗВИМА: НУЛЕВАЯ УТЕЧКА ДАННЫХ И ПОЛНАЯ НЕВИДИМОСТЬ║
@@ -3766,6 +4183,12 @@ claude
 # Запуск десктопного приложения Claude Desktop
 claude-desktop
 
+# Проверка статуса клетки для статус-баров (Polybar, Waybar, bspwm)
+cld-status
+# Вывод: 🔒 Claude: VPN (SG)  - туннель активен, выход защищён
+#        🛑 Claude: Isolated  - VPN отключён, трафик заблокирован (Fail-Closed)
+#        ⭕ Claude: Off       - сеть клетки не поднята
+
 # Выполнение любой утилиты внутри изолированной песочницы
 cld-cage ping -c 1 127.0.0.1
 cld-cage curl https://icanhazip.com
@@ -3779,7 +4202,7 @@ cld-cage --down          # Полная очистка правил nftables и 
 ```
 
 > [!IMPORTANT]
-> **Защита от обнаружения клетки:** При попытке запустить команду `claude` непосредственно из каталога репозитория ClaudeCage обёртка прервёт выполнение с предупреждением. Это сделано для того, чтобы запущенный ИИ-агент не обнаружил файлы клетки и факт своей изоляции. Для работы перейдите в каталог вашего рабочего проекта.
+> **Защита от обнаружения клетки:** При попытке запустить команду `claude` непосредственно из каталога репозитория ClaudeCage (`~/.netif-core` или `~/.ClaudeCage_Linux`) обёртка прервёт выполнение с предупреждением. Это сделано для того, чтобы запущенный ИИ-агент не обнаружил файлы клетки и факт своей изоляции. Для работы перейдите в каталог вашего рабочего проекта.
 
 ---
 
@@ -3791,17 +4214,17 @@ cld-cage --down          # Полная очистка правил nftables и 
 # Сетевой интерфейс вашего VPN-клиента (default: amn0)
 VPN_IFACE="amn0"
 
-# Адрес изолированного DNS-резолвера туннеля
-VPN_DNS="100.64.0.1"
+# Адрес изолированного DNS-резолвера туннеля ("auto" или фиксированный IP)
+VPN_DNS="auto"
 
 # Адрес для liveness-проверки жизнеспособности туннеля
 VPN_PROBE="1.1.1.1"
 
-# Эмулируемый часовой пояс (должен соответствовать локации вашего VPN)
-CLD_TZ="Europe/Amsterdam"
+# Эмулируемый часовой пояс ("auto" для авто-определения по VPN IP или конкретная зона)
+CLD_TZ="auto"
 
 # Путь к локальному репозиторию ClaudeCage для сокрытия от агента
-CAGE_REPO_DIR="/home/username/.ClaudeCage_Linux"
+CAGE_REPO_DIR="/home/username/.netif-core"
 ```
 
 ---
@@ -3822,43 +4245,43 @@ CAGE_REPO_DIR="/home/username/.ClaudeCage_Linux"
 
 ```
 
-
 ---
 
-## ❓ ВОПРОСЫ И ЗАДАЧИ ДЛЯ АУДИТА GEMINI ARGON 4
+## ❓ 6. ВОПРОСЫ И ЗАДАЧИ ДЛЯ ФИНАЛЬНОГО АУДИТА GEMINI ARGON 4
 
-Пожалуйста, проведи глубокий, дотошный анализ всего проекта и ответь на следующие вопросы:
+Пожалуйста, проведи глубокий, дотошный анализ всего проекта и представь подробный экспертный отчёт по следующим направлениям:
 
-1. **Релизная готовность и архитектурный вердикт:**
-   - Готов ли проект к публичному релизу v3.1.0 на GitHub в качестве готового open-source решения?
-   - Какие узкие места, риски или скрытые архитектурные компромиссы ты видишь?
+### 1. Архитектурный вердикт и готовность к релизу
+- Готов ли проект к официальному публичному релизу v3.1.0 на GitHub в качестве open-source решения?
+- Какие риски, скрытые архитектурные компромиссы или неучтенные сценарии остаются в текущей реализации?
 
-2. **Анализ векторов деанонимизации и Sandbox Escape:**
-   - Существуют ли неочевидные способы, которыми запущенный процесс внутри Bubblewrap (Node.js или Electron) может:
-     а) узнать реальный внешний IP или физические интерфейсы хоста?
-     б) определить, что он находится внутри сетевого namespace или контейнера?
-     в) совершить LPE-побег или прочитать хостовые переменные окружения?
-   - Насколько надежна мимикрия адаптера `enp3s0` с Intel OUI MAC по сравнению с реальной сетевой картой?
+### 2. Анализ Kill Switch и ядра Linux (Fail-Closed & Race Conditions)
+- Оцени надежность связки: `nftables prerouting_filter raw drop RFC1918` + `nftables forward drop` строго выше `ct established` + `policy routing table 200 metric 9999 unreachable default` + `systemd netlink watchdog`.
+- Существует ли хотя бы теоретический race condition при внезапном падении туннеля VPN (`amn0`), при котором хотя бы 1 сетевой пакет успеет уйти через физический шлюз хоста (`wlan0` или `eth0`)?
+- Насколько корректно работает `ss -K -tu 'not dst 127.0.0.0/8'`? Гарантирует ли эта команда сохранение внутренних соединений IPC/MCP при мгновенном сбросе внешних утечек?
 
-3. **Сетевой стек и Kill Switch (Kernel Hardening):**
-   - Насколько корректно построена связка: `prerouting_filter raw drop RFC1918` + `nftables forward drop` выше conntrack + `policy routing table 200 metric 9999 unreachable` + `systemd watchdog`?
-   - Есть ли race condition при падении туннеля VPN между моментом сброса линка и срабатыванием Netlink watchdog? Возможен ли хоть один пакет утечки наружу мимо VPN?
+### 3. Анализ Deep Stealth и обхода антифрода Anthropic
+- Насколько эффективен комплекс мер сокрытия клетки от ИИ-агента:
+  - Мимикрия адаптера `enp3s0` с MAC-адресом Intel OUI (`ac:1f:6b`).
+  - Передача аргументов `bwrap` через файловый дескриптор `--args 10` и исполнение entrypoint через stdin (`/bin/bash -s --`) с последующим `exec 0<&3 3<&-`.
+  - Динамическое авто-определение таймзоны (`CLD_TZ="auto"`) и спуфинг `/etc/localtime` / `/etc/locale.conf`.
+  - Перенос репозитория в нейтральный каталог `~/.netif-core` и исключение лишних tmpfs-монтирований из `/proc/self/mountinfo`.
+- Существуют ли неочевидные векторы, с помощью которых Node.js (Claude Code CLI) или Chromium/Electron (Claude Desktop) могут обнаружить факт песочницы или виртуализации?
 
-4. **Переносимость и кросс-дистрибутивность (Portability):**
-   - Будут ли скрипты `install.sh`, `uninstall.sh`, `bin/cld-cage`, `bin/celltest` и `bin/cld-probe` без модификаций работать на:
-     - Ubuntu 22.04 / 24.04 LTS
-     - Debian 12 (Bookworm)
-     - Fedora 39 / 40
-     - Arch Linux (текущий рабочий дистрибутив)
-   - Есть ли дистрибутиво-зависимые пути или особенности (например, `sudoers.d`, пути к `zoneinfo`, `node_modules`, `fish`, `python3`)?
+### 4. Голосовой режим (Voice Mode) и интеграция с рабочим столом
+- Насколько безопасен проброс аудио-сокетов PipeWire (`pipewire-0`) и PulseAudio (`pulse/native`)? Возможно ли через них осуществить sandbox escape, просканировать сеть хоста или получить доступ к несанкционированным данным?
+- Оцени перехватчик `xdg-desktop-handler` и фильтрацию D-Bus через `xdg-dbus-proxy`.
 
-5. **Пользовательский опыт (UX) и обслуживание:**
-   - Удобно ли конечному пользователю разворачивать проект одной командой `./install.sh`?
-   - Не сломает ли инсталлятор существующую конфигурацию сети хоста, WireGuard, Docker или другие сетевые службы?
-   - Корректно ли работает авто-восстановление обёрток при обновлении Claude Code через `npm update -g @anthropic-ai/claude-code`?
+### 5. Кросс-дистрибутивность и переносимость
+- Будут ли скрипты установки и рантайма работать без изменений на:
+  - Arch Linux (текущий дистрибутив разработки)
+  - Ubuntu 22.04 LTS / 24.04 LTS
+  - Debian 12 (Bookworm)
+  - Fedora 39 / 40
+- Учтены ли дистрибутиво-зависимые пути (`visudo`, `zoneinfo`, `node_modules`, `libnotify-bin`)?
 
-6. **Финальные рекомендации перед релизом:**
-   - Раздели свои замечания на категории:
-     - **P0 (Блокеры):** критичные проблемы безопасности или стабильности, требующие исправления ДО публикации релиза.
-     - **P1 (Важные улучшения):** архитектурные и функциональные доработки, рекомендуемые в первом минорном обновлении.
-     - **P2 (Пожелания и polish):** документация, оформление, дополнительные фичи на будущее.
+### 6. Итоговая категоризация рекомендаций
+Раздели свои замечания на три четкие категории:
+- **P0 (Блокеры):** Критичные уязвимости или ошибки, требующие исправления ДО публикации релиза.
+- **P1 (Важные улучшения):** Архитектурные рекомендации для включения в следующий минорный релиз (v3.2).
+- **P2 (Пожелания и polish):** Косметические правки, документация и оптимизации.

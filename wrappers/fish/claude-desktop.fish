@@ -10,5 +10,12 @@ function claude-desktop --description 'Run Claude Desktop inside isolated stealt
         end
     end
 
-    sudo /usr/local/bin/cld-cage claude-desktop $argv
+    sudo -n /usr/local/bin/cld-cage claude-desktop $argv
+    set -l status_code $status
+    if test $status_code -ne 0
+        if type -q notify-send
+            notify-send -u critical "ClaudeCage" "Ошибка запуска Claude Desktop (код $status_code): проверьте sudoers и VPN"
+        end
+        return $status_code
+    end
 end

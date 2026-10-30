@@ -245,6 +245,7 @@ def probe_proc_isolation():
 
     mountinfo_has_cld_net = False
     mountinfo_has_cage_markers = False
+    mountinfo_has_repo_name = False
     try:
         if os.path.exists("/proc/self/mountinfo"):
             with open("/proc/self/mountinfo") as f:
@@ -253,6 +254,8 @@ def probe_proc_isolation():
                     mountinfo_has_cld_net = True
                 if any(m in content for m in ["cld-cage", "claude-vpn", "sys-net", "xdg-open-jail"]):
                     mountinfo_has_cage_markers = True
+                if "claudecage" in content:
+                    mountinfo_has_repo_name = True
     except Exception:
         pass
 
@@ -312,6 +315,7 @@ def probe_proc_isolation():
         "ru_in_environ": ru_in_environ,
         "mountinfo_has_cld_net": mountinfo_has_cld_net,
         "mountinfo_has_cage_markers": mountinfo_has_cage_markers,
+        "mountinfo_has_repo_name": mountinfo_has_repo_name,
         "machine_id": mid,
         "cmdline_leak": cmdline_leak,
         "sys_net_enp3s0_address": sys_net_enp3s0_address,
@@ -383,6 +387,7 @@ def probe_stealth():
 
     home = os.environ.get("HOME", "")
     cage_dirs = [
+        os.path.join(home, ".netif-core"),
         os.path.join(home, ".ClaudeCage_Linux"),
         os.path.join(home, "ClaudeCage_Linux"),
         os.path.join(home, ".cld-cage"),
@@ -393,7 +398,9 @@ def probe_stealth():
     for cd in cage_dirs:
         if os.path.isdir(cd):
             cage_repo_found = True
-            cnt = len(os.listdir(cd))
+            # Исключаем служебные файлы сессий и якорей агента (.session*)
+            files = [f for f in os.listdir(cd) if not f.startswith(".session")]
+            cnt = len(files)
             if cnt > cage_files_count:
                 cage_files_count = cnt
 
@@ -547,7 +554,7 @@ class ClaudeProbe:
             cvpn = "/usr/local/bin/claude-vpn"
         
         env = os.environ.copy()
-        env["SUDO_USER"] = getattr(self, "target_user", "milk13")
+        env["SUDO_USER"] = getattr(self, "target_user", os.environ.get("USER", "user"))
 
         if os.geteuid() == 0:
             cmd = [cvpn, "python3", "-c", CAGE_PROBE_SCRIPT]
@@ -798,11 +805,14 @@ class ClaudeProbe:
         local_wrap = st.get("local_bin_wrapper_visible", False) or st.get("fish_probe_visible", False)
         proc_iso = cr.get("proc_isolation", {})
         has_cld_net_mount = proc_iso.get("mountinfo_has_cld_net", False) or proc_iso.get("mountinfo_has_cage_markers", False)
+        has_repo_mount = proc_iso.get("mountinfo_has_repo_name", False)
         cage_mid = proc_iso.get("machine_id", "")
         real_mid = hb.get("real_machine_id", "")
 
         stealth_status = "SAFE"
         stealth_desc = f"Репозиторий скрыт ({max(0, cage_files)} файлов); логи изолированы ({logs_files} файлов); mountinfo чист; machine-id изолирован"
+        if has_repo_mount and not has_cld_net_mount:
+            stealth_desc = f"Репозиторий скрыт ({max(0, cage_files)} файлов); логи изолированы; в mountinfo путь ~/.ClaudeCage_Linux (переименуйте в ~/.netif-core для 100% стелса)"
         if cage_files > 0:
             stealth_status = "LEAK"
             stealth_desc = f"УТЕЧКА: ИИ-агент может прочитать {cage_files} файлов репозитория ClaudeCage!"

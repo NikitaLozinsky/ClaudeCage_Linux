@@ -31,7 +31,7 @@ echo -e "${GREEN}[✓]${NC} Службы systemd остановлены и уд�
 
 # 3. Удаление системных файлов и sudoers
 sudo rm -f /usr/local/bin/cld-cage /usr/local/bin/claude-vpn
-sudo rm -f /usr/local/bin/celltest
+sudo rm -f /usr/local/bin/celltest /usr/local/bin/cld-status
 sudo rm -f /usr/local/bin/cld-probe /usr/local/bin/claude-probe
 sudo rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn /usr/local/lib/xdg-desktop-handler
 sudo rm -f /etc/sudoers.d/cld-cage /etc/sudoers.d/claude-vpn
@@ -57,7 +57,7 @@ fi
 rm -f "${USER_BIN}/claude-desktop"
 rm -f "${USER_BIN}/celltest"
 rm -f "${USER_BIN}/cld-probe" "${USER_BIN}/claude-probe"
-rm -f "${USER_BIN}/cld-cage" "${USER_BIN}/claude-vpn"
+rm -f "${USER_BIN}/cld-cage" "${USER_BIN}/claude-vpn" "${USER_BIN}/cld-status.sh"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude.fish"
 rm -f "${TARGET_HOME}/.config/fish/functions/claude-desktop.fish"
 rm -f "${TARGET_HOME}/.config/fish/functions/cld-probe.fish" "${TARGET_HOME}/.config/fish/functions/claude-probe.fish"

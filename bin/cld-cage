@@ -38,10 +38,10 @@ TICK=10
 
 # Default configuration values (overridden by /etc/cld-cage.conf or /etc/claude-vpn.conf)
 VPN_IFACE="amn0"
-VPN_DNS="100.64.0.1"
+VPN_DNS="auto"
 VPN_PROBE="1.1.1.1"
-CLAUDE_TZ="Europe/Amsterdam"
-CLD_TZ="Europe/Amsterdam"
+CLAUDE_TZ="auto"
+CLD_TZ="auto"
 CAGE_REPO_DIR=""
 CAGE_MACHINE_ID=""
 
@@ -59,8 +59,8 @@ ensure_cage_machine_id() {
 
 readonly IFACE_RE='^[A-Za-z0-9_.-]{1,15}$'
 readonly OCT='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
-readonly IPV4_RE="^${OCT}\\.${OCT}\\.${OCT}\\.${OCT}\$"
-readonly TZ_RE='^(UTC|[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+)$'
+readonly IPV4_RE="^(${OCT}\\.${OCT}\\.${OCT}\\.${OCT}|auto)\$"
+readonly TZ_RE='^(auto|UTC|[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+)$'
 
 # Output formatting
 if [[ -t 1 && -t 2 ]]; then
@@ -107,10 +107,87 @@ load_config() {
     if [[ -n $v ]]; then [[ $v =~ $TZ_RE ]] || { err "CLD_TZ некорректен: '$v'"; return 1; }; CLD_TZ=$v; CLAUDE_TZ=$v; fi
     v=$(conf_get "$f" CAGE_REPO_DIR)
     if [[ -n $v ]]; then CAGE_REPO_DIR=$v; fi
-    if [[ ! -d "$CAGE_REPO_DIR" && -d "${REAL_HOME:-$HOME}/.ClaudeCage_Linux" ]]; then
-        CAGE_REPO_DIR="${REAL_HOME:-$HOME}/.ClaudeCage_Linux"
+    if [[ ! -d "$CAGE_REPO_DIR" ]]; then
+        if [[ -d "${REAL_HOME:-$HOME}/.netif-core" ]]; then
+            CAGE_REPO_DIR="${REAL_HOME:-$HOME}/.netif-core"
+        elif [[ -d "${REAL_HOME:-$HOME}/.ClaudeCage_Linux" ]]; then
+            CAGE_REPO_DIR="${REAL_HOME:-$HOME}/.ClaudeCage_Linux"
+        fi
     fi
     return 0
+}
+
+# ── Dynamic VPN Geo, Timezone & DNS Resolution ───────────────────
+detect_vpn_geo() {
+    local cur_vip tz="" cc=""
+    cur_vip=$(vpn_ip)
+    if [[ -z "$cur_vip" ]]; then
+        echo "UTC"
+        return 0
+    fi
+
+    # 1. Fast Cache check: if VPN IP has not changed, return cached timezone immediately
+    if [[ -f "$STATE_DIR/cached_tz" && -f "$STATE_DIR/cached_vip" ]]; then
+        if [[ "$(cat "$STATE_DIR/cached_vip" 2>/dev/null)" == "$cur_vip" ]]; then
+            local c_tz
+            c_tz=$(cat "$STATE_DIR/cached_tz" 2>/dev/null)
+            if [[ -n "$c_tz" && -f "/usr/share/zoneinfo/$c_tz" ]]; then
+                echo "$c_tz"
+                return 0
+            fi
+        fi
+    fi
+
+    # 2. Live detection via VPN tunnel interface
+    tz=$(curl -s --interface "$VPN_IFACE" --max-time 3 "https://ipinfo.io/timezone" 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$tz" || ! -f "/usr/share/zoneinfo/$tz" ]]; then
+        tz=$(curl -s --interface "$VPN_IFACE" --max-time 3 "http://ip-api.com/line/?fields=timezone" 2>/dev/null | tr -d '[:space:]')
+    fi
+    if [[ -z "$tz" || ! -f "/usr/share/zoneinfo/$tz" ]]; then
+        tz=$(curl -s --interface "$VPN_IFACE" --max-time 3 "http://worldtimeapi.org/api/ip" 2>/dev/null | sed -n 's/.*"timezone":"\([^"]*\)".*/\1/p' | tr -d '[:space:]')
+    fi
+
+    if [[ -n "$tz" && -f "/usr/share/zoneinfo/$tz" ]]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        printf '%s\n' "$tz" > "$STATE_DIR/cached_tz" 2>/dev/null || true
+        printf '%s\n' "$cur_vip" > "$STATE_DIR/cached_vip" 2>/dev/null || true
+        cc=$(curl -s --interface "$VPN_IFACE" --max-time 2 "https://ipinfo.io/country" 2>/dev/null | tr -d '[:space:]' || true)
+        [[ -z "$cc" ]] && cc=$(curl -s --interface "$VPN_IFACE" --max-time 2 "http://ip-api.com/line/?fields=countryCode" 2>/dev/null | tr -d '[:space:]' || true)
+        [[ -n "$cc" ]] && printf '%s\n' "$cc" > "$STATE_DIR/cached_cc" 2>/dev/null || true
+        chmod 0644 "$STATE_DIR"/cached_* 2>/dev/null || true
+        echo "$tz"
+        return 0
+    fi
+
+    if [[ -f "$STATE_DIR/cached_tz" ]]; then
+        cat "$STATE_DIR/cached_tz" 2>/dev/null
+    else
+        echo "UTC"
+    fi
+}
+
+resolve_tz() {
+    if [[ "$CLD_TZ" != "auto" && -n "$CLD_TZ" && "$CLD_TZ" != "UTC" && -f "/usr/share/zoneinfo/$CLD_TZ" ]]; then
+        echo "$CLD_TZ"
+    else
+        detect_vpn_geo
+    fi
+}
+
+resolve_dns() {
+    if [[ "$VPN_DNS" != "auto" && -n "$VPN_DNS" ]]; then
+        echo "$VPN_DNS"
+        return 0
+    fi
+    local d=""
+    if command -v resolvectl >/dev/null 2>&1; then
+        d=$(resolvectl dns "$VPN_IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; exit}}')
+    fi
+    if [[ -n "$d" ]]; then
+        echo "$d"
+    else
+        echo "100.64.0.1"
+    fi
 }
 
 # ── VPN Tunnel Helpers ───────────────────────────────────────────
@@ -223,6 +300,7 @@ EOF
 }
 
 setup_nftables() {
+    VPN_DNS=$(resolve_dns)
     local rules; rules=$(nft_rules)
     nft -c -f - <<<"$rules" || { err "nft: ошибка синтаксиса правил!"; return 1; }
     nft -f - <<<"$rules"    || { err "nft: ядро отклонило транзакцию правил!"; return 1; }
@@ -272,21 +350,6 @@ ensure_netns() {
     mac_hash=$(printf '%s-enp3s0' "$CAGE_MACHINE_ID" | sha256sum | cut -c1-6)
     synth_mac="ac:1f:6b:${mac_hash:0:2}:${mac_hash:2:2}:${mac_hash:4:2}"
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" address "$synth_mac" 2>/dev/null || true
-
-    # Создание структуры sysfs для мимикрии атрибутов адаптера в bwrap
-    mkdir -p "$STATE_DIR/sys-net/enp3s0" "$STATE_DIR/sys-net/lo" 2>/dev/null || true
-    printf '%s\n' "$synth_mac" > "$STATE_DIR/sys-net/enp3s0/address" 2>/dev/null || true
-    printf 'up\n' > "$STATE_DIR/sys-net/enp3s0/operstate" 2>/dev/null || true
-    printf '%s\n' "$mtu" > "$STATE_DIR/sys-net/enp3s0/mtu" 2>/dev/null || true
-    printf '1\n' > "$STATE_DIR/sys-net/enp3s0/type" 2>/dev/null || true
-    printf '1\n' > "$STATE_DIR/sys-net/enp3s0/carrier" 2>/dev/null || true
-
-    printf '00:00:00:00:00:00\n' > "$STATE_DIR/sys-net/lo/address" 2>/dev/null || true
-    printf 'unknown\n' > "$STATE_DIR/sys-net/lo/operstate" 2>/dev/null || true
-    printf '65536\n' > "$STATE_DIR/sys-net/lo/mtu" 2>/dev/null || true
-    printf '772\n' > "$STATE_DIR/sys-net/lo/type" 2>/dev/null || true
-    printf '1\n' > "$STATE_DIR/sys-net/lo/carrier" 2>/dev/null || true
-    chmod -R 755 "$STATE_DIR/sys-net" 2>/dev/null || true
 
     ip netns exec "$NETNS" ip addr replace "${NS_IP}/${PREFIX}" dev "$VETH_NS" || return 1
     ip netns exec "$NETNS" ip link set dev "$VETH_NS" mtu "$mtu" up || return 1
@@ -388,13 +451,17 @@ reconcile_state() {
             ip netns exec "$NETNS" ip link set dev "$VETH_NS" mtu "$m" 2>/dev/null || true
             LAST_MTU=$m
         fi
-        ((flap)) && purge_sockets "флап интерфейса туннеля"
+        if ((flap)); then
+            rm -f "$STATE_DIR/cached_vip" 2>/dev/null || true
+            purge_sockets "флап интерфейса туннеля"
+        fi
         if ((LAST_HEALTH != 1)); then
             info "Туннель $VPN_IFACE здоров, маршрут в table $RT_TABLE активен"
             LAST_HEALTH=1
         fi
     else
         vpn_route_clear
+        rm -f "$STATE_DIR/cached_vip" 2>/dev/null || true
         if ((LAST_HEALTH != 0)); then
             warn "Туннель $VPN_IFACE недоступен: маршрут снят, клетка в fail-closed"
             purge_sockets "туннель отключился"
@@ -436,13 +503,18 @@ cmd_up() {
     need ip nft sysctl
     step "Поднятие изолированного пространства $NETNS"
     save_orig_forward
+    VPN_DNS=$(resolve_dns)
+    CLAUDE_TZ=$(resolve_tz)
     policy_up        || { err "Policy routing не поднялся"; cmd_down; return 1; }
     setup_nftables   || { err "Сбой инициализации nftables"; cmd_down; return 1; }
     host_hooks_up    || warn "Не удалось добавить правила в inet filter forward хоста"
     ensure_netns     || { err "Сбой создания netns/veth"; cmd_down; return 1; }
     if vpn_is_up; then
         vpn_route_set
-        info "Туннель $VPN_IFACE активен, маршрут установлен"
+        local cc; cc=$(cat "$STATE_DIR/cached_cc" 2>/dev/null || echo "")
+        local geo_label="$CLAUDE_TZ"
+        [[ -n "$cc" ]] && geo_label="$CLAUDE_TZ ($cc)"
+        info "Туннель $VPN_IFACE активен, маршрут установлен (Локация: $geo_label, DNS: $VPN_DNS)"
     else
         warn "Туннель $VPN_IFACE не активен: клетка fail-closed (трафик заблокирован)"
     fi
@@ -473,10 +545,16 @@ cmd_down() {
 cmd_status() {
     local ok=0
     echo -e "${C_B}${C_C}=== Статус ClaudeCage (v$VERSION) ===${C_0}"
+    local active_tz active_dns active_cc
+    active_tz=$(resolve_tz)
+    active_dns=$(resolve_dns)
+    active_cc=$(cat "$STATE_DIR/cached_cc" 2>/dev/null || echo "")
     if vpn_is_up; then
-        info "VPN ($VPN_IFACE): ПОДКЛЮЧЁН — $(vpn_ip) (MTU: $(get_vpn_mtu))"
+        local geo_label="$active_tz"
+        [[ -n "$active_cc" ]] && geo_label="$active_tz ($active_cc)"
+        info "VPN ($VPN_IFACE): ПОДКЛЮЧЁН — $(vpn_ip) [Локация: ${geo_label}, DNS: ${active_dns}, MTU: $(get_vpn_mtu)]"
     else
-        warn "VPN ($VPN_IFACE): ОТКЛЮЧЁН (Fail-Closed Kill Switch активен)"
+        warn "VPN ($VPN_IFACE): ОТКЛЮЧЁН (Fail-Closed Kill Switch активен, локация: ${active_tz})"
     fi
     if netns_exists; then
         local pids; pids=$(ip netns pids "$NETNS" 2>/dev/null | wc -l)
@@ -536,12 +614,15 @@ cmd_monitor() {
 }
 
 cmd_print_config() {
+    local active_tz active_dns
+    active_tz=$(resolve_tz)
+    active_dns=$(resolve_dns)
     cat <<EOF
 VPN_IFACE=$VPN_IFACE
-VPN_DNS=$VPN_DNS
+VPN_DNS=$active_dns
 VPN_PROBE=$VPN_PROBE
-CLD_TZ=$CLD_TZ
-CLAUDE_TZ=$CLAUDE_TZ
+CLD_TZ=$active_tz
+CLAUDE_TZ=$active_tz
 CAGE_REPO_DIR=$CAGE_REPO_DIR
 NETNS=$NETNS
 VETH_HOST=$VETH_HOST
@@ -572,7 +653,7 @@ resolve_user() {
 }
 
 bwrap_has_overlay() {
-    bwrap --help 2>&1 | grep -q -- '--tmp-overlay'
+    bwrap --dev-bind / / --overlay-src /etc --tmp-overlay /etc -- true >/dev/null 2>&1
 }
 
 proxy_start() {
@@ -608,6 +689,9 @@ cmd_run() {
     netns_exists || cmd_up || exit 1
     ensure_watchdog
 
+    VPN_DNS=$(resolve_dns)
+    CLAUDE_TZ=$(resolve_tz)
+
     APP=("$@")
     local base=${APP[0]##*/} desktop=0
 
@@ -636,18 +720,30 @@ if ip -4 -o addr show dev enp3s0 2>/dev/null | grep -q '10\.200\.1\.2/24' || ip 
     if [ -x "$HOME/.local/bin/claude" ] && ! grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
         exec "$HOME/.local/bin/claude" "$@"
     fi
-    if [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
-        exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
-    fi
+    for p in \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude" \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js"; do
+        if [ -x "$p" ]; then exec "$p" "$@"; fi
+    done
 fi
 case "$PWD" in
-    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*)
+    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*|*/.netif-core*|*/.netif-core)
         echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
         echo "Перейдите в каталог вашего рабочего проекта." >&2
         exit 1
         ;;
 esac
-exec sudo /usr/local/bin/cld-cage claude "$@"
+if ! sudo -n /usr/local/bin/cld-cage claude "$@"; then
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "Ошибка запуска Claude Code внутри клетки (код $status)." >&2
+        echo "Убедитесь, что настроен /etc/sudoers.d/cld-cage (запустите install.sh)." >&2
+        if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]] && command -v notify-send >/dev/null 2>&1; then
+            notify-send -u critical "ClaudeCage" "Ошибка прав sudoers или сети при запуске Claude Code. Запустите install.sh"
+        fi
+    fi
+    exit $status
+fi
 EOF_WRAP
                 chmod +x "${user_local_bin}/claude"
                 chown "${REAL_USER}:${REAL_USER}" "${user_local_bin}/claude" "${user_local_bin}/claude-raw" 2>/dev/null || true
@@ -656,8 +752,12 @@ EOF_WRAP
 
             if [[ -x "${user_local_bin}/claude-raw" || -x "${user_local_bin}/claude" ]]; then
                 APP[0]="${user_local_bin}/claude"
-            elif [[ -x "${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]]; then
-                APP[0]="${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+            else
+                for p in \
+                    "${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude" \
+                    "${REAL_HOME}/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js"; do
+                    if [[ -x "$p" ]]; then APP[0]="$p"; break; fi
+                done
             fi
             ;;
         claude-desktop)
@@ -687,7 +787,7 @@ EOF_WRAP
     fi
 
     local -a clean_env=(
-        "BROWSER=${JAIL_XDG_OPEN}"
+        "BROWSER=/usr/bin/xdg-open"
         "HOME=${REAL_HOME}"
         "USER=${REAL_USER}"
         "LOGNAME=${REAL_USER}"
@@ -744,7 +844,6 @@ EOF_WRAP
 
     bw_args+=(
         --tmpfs /sys/class/net
-        --tmpfs "$STATE_DIR"
     )
 
     # 3. Маскировка беспроводных подсистем ядра (Wi-Fi, regulatory domain)
@@ -757,6 +856,7 @@ EOF_WRAP
 
     # 5. Оверлей /etc, /etc/systemd/system, /usr/local/bin, ~/.local/bin, ~/.config/fish/functions (или fallback для старых bwrap)
     if bwrap_has_overlay; then
+        bw_args+=(--tmpfs "$STATE_DIR")
         bw_args+=(--overlay-src /etc --tmp-overlay /etc)
         [[ -d /etc/systemd/system ]] && bw_args+=(--overlay-src /etc/systemd/system --tmp-overlay /etc/systemd/system)
         [[ -d /usr/local/bin ]] && bw_args+=(--overlay-src /usr/local/bin --tmp-overlay /usr/local/bin)
@@ -788,9 +888,10 @@ EOF_WRAP
         [[ -f /var/lib/dbus/machine-id ]] && bw_args+=(--ro-bind "$STATE_DIR/spoof/machine-id" /var/lib/dbus/machine-id)
         bw_args+=(--ro-bind "$STATE_DIR/spoof/resolv.conf" /etc/resolv.conf)
         local b c
-        for b in cld-cage claude-vpn celltest cld-probe claude-probe; do
+        for b in cld-cage claude-vpn celltest cld-probe claude-probe cld-status; do
             [[ -e "/usr/local/bin/$b" ]] && bw_args+=(--ro-bind /dev/null "/usr/local/bin/$b")
         done
+        [[ -e "$JAIL_XDG_OPEN" ]] && bw_args+=(--ro-bind /dev/null "$JAIL_XDG_OPEN")
         for c in cld-cage.conf claude-vpn.conf; do
             [[ -e "/etc/$c" ]] && bw_args+=(--ro-bind /dev/null "/etc/$c")
         done
@@ -798,9 +899,12 @@ EOF_WRAP
             bw_args+=(--tmpfs "${REAL_HOME}/.local/state/cld-cage")
         fi
         local ubin="${REAL_HOME}/.local/bin"
-        for b in celltest cld-probe claude-probe claude-vpn; do
+        for b in celltest cld-probe claude-probe claude-vpn cld-status; do
             [[ -e "${ubin}/$b" ]] && bw_args+=(--ro-bind /dev/null "${ubin}/$b")
         done
+
+        # P0 FIX: Маскируем STATE_DIR ТОЛЬКО ПОСЛЕ того, как смонтированы все ro-bind из $STATE_DIR/spoof!
+        bw_args+=(--tmpfs "$STATE_DIR")
     fi
 
     # 6. Сокрытие каталога репозитория ClaudeCage и логов в домашней директории
@@ -811,7 +915,14 @@ EOF_WRAP
     for cdir in "${REAL_HOME}"/*ClaudeCage* "${REAL_HOME}"/*claude-vpn* "${REAL_HOME}"/*claudecage* "${REAL_HOME}"/*cld-cage* \
                 "${REAL_HOME}"/.*ClaudeCage* "${REAL_HOME}"/.*claude-vpn* "${REAL_HOME}"/.*claudecage* "${REAL_HOME}"/.*cld-cage*; do
         if [[ -d "$cdir" && "$cdir" != "$CAGE_REPO_DIR" ]]; then
-            bw_args+=(--tmpfs "$cdir")
+            # Монтируем tmpfs только если каталог содержит файлы репозитория или .git.
+            # Если это пустой каталог-заглушка или содержит только служебные якоря сессии (.*),
+            # не монтируем tmpfs, чтобы не оставлять следы с именем клетки в /proc/self/mountinfo.
+            local _non_hidden_files
+            _non_hidden_files=$(find "$cdir" -mindepth 1 -maxdepth 2 -not -name ".*" 2>/dev/null | head -n 1)
+            if [[ -n "$_non_hidden_files" || -d "$cdir/.git" ]]; then
+                bw_args+=(--tmpfs "$cdir")
+            fi
         fi
     done
 
@@ -865,7 +976,7 @@ printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/stub-resolv.conf 2>/dev
 printf "nameserver __VPN_DNS__\n" > /run/systemd/resolve/resolv.conf 2>/dev/null || true
 rm -f /etc/cld-cage* /etc/claude-vpn* /etc/sudoers.d/cld-cage* /etc/sudoers.d/claude-vpn* 2>/dev/null || true
 rm -f /etc/systemd/system/cld-cage* /etc/systemd/system/claude-vpn* 2>/dev/null || true
-rm -f /usr/local/bin/cld-cage* /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/cld-probe* /usr/local/bin/claude-probe* 2>/dev/null || true
+rm -f /usr/local/bin/cld-cage* /usr/local/bin/claude-vpn* /usr/local/bin/celltest* /usr/local/bin/cld-probe* /usr/local/bin/claude-probe* /usr/local/bin/cld-status* 2>/dev/null || true
 rm -rf /usr/local/lib/cld-cage /usr/local/lib/claude-vpn /usr/local/lib/xdg-desktop-handler 2>/dev/null || true
 
 mkdir -p /sys/class/net/enp3s0 /sys/class/net/lo 2>/dev/null || true
@@ -882,8 +993,10 @@ printf '1\n' > /sys/class/net/lo/carrier 2>/dev/null || true
 
 if [ -e "$HOME/.local/bin/claude-raw" ]; then
     mv -f "$HOME/.local/bin/claude-raw" "$HOME/.local/bin/claude" 2>/dev/null || true
+elif grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
+    rm -f "$HOME/.local/bin/claude" 2>/dev/null || true
 fi
-rm -f "$HOME/.local/bin/claude-desktop" "$HOME/.local/bin/celltest"* "$HOME/.local/bin/cld-probe"* "$HOME/.local/bin/claude-probe"* "$HOME/.local/bin/claude-vpn"* "$HOME/.local/bin/cld-cage"* 2>/dev/null || true
+rm -f "$HOME/.local/bin/claude-desktop" "$HOME/.local/bin/celltest"* "$HOME/.local/bin/cld-probe"* "$HOME/.local/bin/claude-probe"* "$HOME/.local/bin/claude-vpn"* "$HOME/.local/bin/cld-cage"* "$HOME/.local/bin/cld-status"* 2>/dev/null || true
 rm -f "$HOME/.config/fish/functions/claude.fish" "$HOME/.config/fish/functions/claude-desktop.fish" "$HOME/.config/fish/functions/cld-probe.fish" "$HOME/.config/fish/functions/claude-probe.fish" 2>/dev/null || true
 rm -rf "$HOME/.local/state/cld-cage" 2>/dev/null || true
 {

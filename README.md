@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Linux%20(Arch%20%7C%20Debian%20%7C%20Fedora%20%7C%20Ubuntu)-blue.svg?logo=linux)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![Security](https://img.shields.io/badge/Security-Hardened%20Kill%20Switch-success.svg?logo=securityscorecard)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![Stealth](https://img.shields.io/badge/Stealth-Deep%20Stealth%20%2B%20Kernel%20Hardening-orange.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
-[![Diagnostics](https://img.shields.io/badge/Diagnostics-celltest%20v3.1%2053%2F53%20PASS-brightgreen.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
+[![Diagnostics](https://img.shields.io/badge/Diagnostics-celltest%20v3.1%2054%2F54%20PASS-brightgreen.svg)](https://github.com/NikitaLozinsky/ClaudeCage_Linux)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
@@ -95,26 +95,30 @@ flowchart TD
 - **DROP выше conntrack**: Правило сброса `iifname "veth_host" oifname != "$VPN_IFACE" counter drop` расположено **строго выше** `ct state established,related accept`.
 - **Защита от подмены IP (Anti-Spoofing)**: Пакеты с адресом источника, отличным от `10.200.1.2`, сбрасываются.
 - **Динамический MSS Clamping**: Правило `tcp flags syn tcp option maxseg size set rt mtu` динамически подстраивает размер TCP-сегмента под реальный MTU туннеля.
-- **Принудительный DNAT DNS**: Любые DNS-запросы (порт 53 UDP/TCP) принудительно перенаправляются на доверенный резолвер VPN (`100.64.0.1` или настроенный `VPN_DNS`).
+- **Принудительный DNAT DNS**: Любые DNS-запросы (порт 53 UDP/TCP) принудительно перенаправляются на доверенный резолвер VPN (`VPN_DNS="auto"` через `resolvectl dns` или `100.64.0.1`).
 - **Изоляция Input**: Клетка изолирована от локальных портов хоста (`10.200.1.1` и сервисов `localhost`).
 
 ### Эшелон 3: Песочница файловой системы и Стелс-сокрытие (`bubblewrap`)
 - **PID Namespace & Изоляция /proc**: Флаги `--unshare-pid --proc /proc` скрывают процессы хоста, сетевую статистику `/proc/1/net/dev`, `/proc/1/net/arp` и переменные окружения процессов хоста (`/proc/*/environ`).
 - **Безопасный сброс привилегий**: `setpriv` сбрасывает UID/GID до непривилегированного пользователя с очисткой возможностей (`--inh-caps=-all`, `--no-new-privs`) **до** входа в `bwrap`, блокируя любые попытки LPE-побега через `sudo`.
-- **Сокрытие репозитория ClaudeCage**: Каталог репозитория клетки (расположенный в скрытом `~/.ClaudeCage_Linux`), а также директория логов `~/.local/state/cld-cage` монтируются как пустые `tmpfs`.
-- **Сокрытие служебных бинарников и служб**: Файлы `/usr/local/bin/cld-cage`, `/etc/cld-cage.conf`, `/etc/systemd/system/cld-cage*` полностью удалены из файловой системы внутри сэндбокса через оверлеи.
+- **Нейтральный путь репозитория (`~/.netif-core`)**: Репозиторий размещается по нейтральному системному пути `~/.netif-core`, что гарантирует 100% отсутствие имени `ClaudeCage` в `/proc/self/mountinfo`, `ps aux` и путях монтирования.
+- **Умное скрытие tmpfs**: Каталоги репозиториев монтируются как пустые `tmpfs`. Если каталог пуст или является временным якорем сессии, он не монтируется через `bwrap`, исключая появление лишних точек монтирования в `/proc/self/mountinfo`.
+- **Сокрытие служебных бинарников и служб**: Файлы `/usr/local/bin/cld-cage`, `/etc/cld-cage.conf`, `/etc/systemd/system/cld-cage*`, а также обёртки и функции в `~/.local/bin/` и `~/.config/fish/functions/` полностью скрыты из файловой системы песочницы.
 - **Маскировка `/sys/class/net` и беспроводных подсистем**: Внутри песочницы создана чистая виртуальная структура интерфейсов, содержащая только `lo` и `enp3s0`. Подсистемы `/sys/class/ieee80211`, `/sys/bus/pci/drivers` и `/sys/module/cfg80211` замаскированы.
 - **Естественный Hostname**: Hostname внутри песочницы наследует имя реального компьютера хоста (без выдающих песочницу названий вроде `claude-jail`).
 
 ### Эшелон 4: Нулевая утечка геолокации и языка (Anti-Fraud)
-- **Спуфинг `/etc/localtime`**: Внутри временного оверлея `/etc` симлинк `/etc/localtime` перенаправлен на бинарный файл часового пояса туннеля (по умолчанию `Europe/Amsterdam`). Любые системные вызовы и Node.js `Intl.DateTimeFormat` видят европейское время.
+- **Динамическое авто-определение таймзоны (`CLD_TZ="auto"`)**: Клетка автоматически определяет геолокацию и часовой пояс выхода VPN-туннеля (например, `Asia/Singapore` или `Europe/Amsterdam`) через интерфейс `$VPN_IFACE` с кэшированием в `/run/systemd/netif-cage/cached_tz`. Переключение серверов в Amnezia/WireGuard не требует ручной правки конфигов.
+- **Спуфинг `/etc/localtime`**: Внутри временного оверлея `/etc` симлинк `/etc/localtime` указывает на бинарный файл часового пояса туннеля. Node.js `Intl.DateTimeFormat` и системные вызовы видят время страны VPN-выхода.
 - **Спуфинг `/etc/locale.conf`**: Файл принудительно подменён на `LANG=en_US.UTF-8` и `LC_ALL=en_US.UTF-8`. Хостовые русские локали `ru_RU` полностью вычищены.
 - **Спуфинг раскладки**: `/etc/vconsole.conf` подменён на `KEYMAP=us`.
 
-### Эшелон 5: Интерактивный TTY и изоляция D-Bus
+### Эшелон 5: Интерактивный TTY, аудиоподсистема и D-Bus
 - **Полноценный TTY для CLI**: Флаг `--new-session` применяется исключительно для GUI Electron. Для CLI Claude Code сохранён управляющий терминал, что обеспечивает бесперебойную работу сигналов `Ctrl+C` (SIGINT) и job control.
-- **Автономный D-Bus**: Приложение запускается через `dbus-run-session`, поднимая чистую сессионную шину без сервисов хоста.
-- **Перехватчик ссылок (`xdg-desktop-handler`)**: Перехватывает URL, копирует в буфер обмена и отправляет нейтральное уведомление на хост через фильтрованный сокет-прокси `xdg-dbus-proxy` (разрешён только `org.freedesktop.Notifications`).
+- **Поддержка голосового режима (PipeWire / PulseAudio)**: Аудио-сокет (`pulse/native` или `pipewire-0`) безопасно пробрасывается в песочницу, позволяя использовать микрофон и голосовой ввод в Claude Desktop без раскрытия сетевых интерфейсов хоста.
+- **Автономный D-Bus и уведомления**: Приложение запускается через `dbus-run-session`, поднимая чистую сессионную шину без сервисов хоста. Ссылки перехватываются `xdg-desktop-handler` с копированием в буфер обмена и отправкой нейтрального уведомления через `xdg-dbus-proxy`.
+- **Неинтерактивный запуск GUI (`sudo -n`)**: Графическая обёртка `claude-desktop` использует `sudo -n` и при сбое авторизации выдаёт нативное графическое предупреждение через `notify-send -u critical`, исключая зависания без терминала.
+- **Индикатор статуса (`cld-status`)**: Легковесный скрипт для Polybar, Waybar, i3blocks или bspwm, выводящий статус клетки: `🔒 Claude: VPN (SG)`, `🛑 Claude: Isolated`, `⭕ Claude: Off`.
 
 ### Эшелон 6: Systemd Watchdog демон реального времени (Netlink)
 - Фоновый демон оформлен в виде системной службы `cld-cage-watchdog.service` с `KillMode=control-group`.
@@ -132,20 +136,29 @@ flowchart TD
 
 ### Установка
 
+Рекомендуется клонировать репозиторий в нейтральный каталог `~/.netif-core` — это гарантирует 100% отсутствие имени `ClaudeCage` в `/proc/self/mountinfo` и процессах:
+
 ```bash
+# Рекомендуемый стелс-вариант установки:
+git clone https://github.com/NikitaLozinsky/ClaudeCage_Linux.git ~/.netif-core
+cd ~/.netif-core
+./install.sh
+
+# Или стандартная установка с автоматической миграцией в стелс-каталог:
 git clone https://github.com/NikitaLozinsky/ClaudeCage_Linux.git
 cd ClaudeCage_Linux
-./install.sh
+./install.sh --stealth
 ```
 
 Инсталлятор в автоматическом режиме:
 1. Проверит наличие всех необходимых зависимостей и синтаксис скриптов.
 2. Установит системный оркестратор `/usr/local/bin/cld-cage` с правами `root:root 0755` (с алиасом `claude-vpn`).
 3. Сконфигурирует безопасный `sudoers` с предварительной валидацией через `visudo -c`.
-4. Автоматически определит активный VPN-интерфейс (`amn0`, `wg0`, `tun0`, `proton0`).
+4. Автоматически определит активный VPN-интерфейс (`amn0`, `wg0`, `tun0`, `proton0`) и часовой пояс выхода.
 5. Установит systemd-службы `cld-cage.service` и `cld-cage-watchdog.service`.
-6. Настроит прозрачные обёртки в `~/.local/bin/` с защитой от запуска внутри репозитория клетки.
-7. Интегрирует Fish-функции и меню приложений.
+6. Настроит прозрачные обёртки в `~/.local/bin/` (CLI `claude`, GUI `claude-desktop`) с защитой от запуска внутри репозитория клетки.
+7. Установит индикатор статуса `cld-status` для Polybar/Waybar/bspwm.
+8. Интегрирует Fish-функции и меню приложений (.desktop).
 
 ---
 
@@ -194,7 +207,7 @@ celltest
   ✔ Внешний Egress IP клетки: 89.105.203.114 (маршрутизируется через amn0)
 
 ━━━ 4. Невидимость и Сокрытие Клетки от ИИ-Агента ━━━
-  ✔ Каталог ClaudeCage (/home/milk13/.ClaudeCage_Linux) полностью скрыт (пустой tmpfs)
+  ✔ Каталог ClaudeCage (/home/milk13/.netif-core) полностью скрыт (пустой tmpfs)
   ✔ Бинарники cld-cage / claude-vpn скрыты из файловой системы песочницы
   ✔ Конфигурационные файлы cld-cage.conf скрыты из песочницы
   ✔ Службы systemd клетки скрыты из /etc/systemd/system
@@ -211,7 +224,11 @@ celltest
   ✔ Беспроводные подсистемы /sys/class/ieee80211 замаскированы (0 утечек Wi-Fi)
   ✔ Аппаратный MAC интерфейса enp3s0: ac:1f:6b:ec:c0:af (Intel OUI ac:1f:6b)
   ✔ Чистота /proc/*/cmdline: аргументы bwrap и текст скрипта скрыты (0 совпадений)
-  ✔ Атрибуты /sys/class/net/enp3s0 доступны внутри bwrap (ac:1f:6b:..., /run/cld-cage скрыт)
+  ✔ Атрибуты /sys/class/net/enp3s0 доступны внутри bwrap (ac:1f:6b:..., state-директория скрыта)
+  ✔ Чистота ~/.local/bin и fish: обёртки скрыты, claude переименован без маркеров клетки
+  ✔ Чистота /proc/self/mountinfo: маркеры cld-cage, claudecage, sys-net и xdg-open-jail отсутствуют
+  ✔ Сокеты в /run/user: маркеры 'jail' и 'cld' отсутствуют (нейтральный dbus proxy)
+  ✔ Аудиоподсистема хоста доступна (PipeWire/PulseAudio сокет проброшен для Voice Mode)
 
 ━━━ 5. DNS Изоляция и Перехват DNAT ━━━
   ✔ DNS внутри клетки указывает только на 100.64.0.1 (изолированный резолвер VPN)
@@ -228,7 +245,7 @@ celltest
   ✔ Обёртка GUI ~/.local/bin/claude-desktop активна
 
 ━━━ Итоговый результат аудита ━━━
-Проверено тестов: 53 | Ошибок: 0 | Предупреждений: 0 | Пропущено: 0
+Проверено тестов: 54 | Ошибок: 0 | Предупреждений: 0 | Пропущено: 0
 
 ╔══════════════════════════════════════════════════════════════════╗
 ║ [✓] СИСТЕМА НЕУЯЗВИМА: НУЛЕВАЯ УТЕЧКА ДАННЫХ И ПОЛНАЯ НЕВИДИМОСТЬ║
@@ -310,6 +327,12 @@ claude
 # Запуск десктопного приложения Claude Desktop
 claude-desktop
 
+# Проверка статуса клетки для статус-баров (Polybar, Waybar, bspwm)
+cld-status
+# Вывод: 🔒 Claude: VPN (SG)  - туннель активен, выход защищён
+#        🛑 Claude: Isolated  - VPN отключён, трафик заблокирован (Fail-Closed)
+#        ⭕ Claude: Off       - сеть клетки не поднята
+
 # Выполнение любой утилиты внутри изолированной песочницы
 cld-cage ping -c 1 127.0.0.1
 cld-cage curl https://icanhazip.com
@@ -323,7 +346,7 @@ cld-cage --down          # Полная очистка правил nftables и 
 ```
 
 > [!IMPORTANT]
-> **Защита от обнаружения клетки:** При попытке запустить команду `claude` непосредственно из каталога репозитория ClaudeCage обёртка прервёт выполнение с предупреждением. Это сделано для того, чтобы запущенный ИИ-агент не обнаружил файлы клетки и факт своей изоляции. Для работы перейдите в каталог вашего рабочего проекта.
+> **Защита от обнаружения клетки:** При попытке запустить команду `claude` непосредственно из каталога репозитория ClaudeCage (`~/.netif-core` или `~/.ClaudeCage_Linux`) обёртка прервёт выполнение с предупреждением. Это сделано для того, чтобы запущенный ИИ-агент не обнаружил файлы клетки и факт своей изоляции. Для работы перейдите в каталог вашего рабочего проекта.
 
 ---
 
@@ -335,17 +358,17 @@ cld-cage --down          # Полная очистка правил nftables и 
 # Сетевой интерфейс вашего VPN-клиента (default: amn0)
 VPN_IFACE="amn0"
 
-# Адрес изолированного DNS-резолвера туннеля
-VPN_DNS="100.64.0.1"
+# Адрес изолированного DNS-резолвера туннеля ("auto" или фиксированный IP)
+VPN_DNS="auto"
 
 # Адрес для liveness-проверки жизнеспособности туннеля
 VPN_PROBE="1.1.1.1"
 
-# Эмулируемый часовой пояс (должен соответствовать локации вашего VPN)
-CLD_TZ="Europe/Amsterdam"
+# Эмулируемый часовой пояс ("auto" для авто-определения по VPN IP или конкретная зона)
+CLD_TZ="auto"
 
 # Путь к локальному репозиторию ClaudeCage для сокрытия от агента
-CAGE_REPO_DIR="/home/username/.ClaudeCage_Linux"
+CAGE_REPO_DIR="/home/username/.netif-core"
 ```
 
 ---

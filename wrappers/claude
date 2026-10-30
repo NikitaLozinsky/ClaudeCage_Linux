@@ -8,20 +8,33 @@ if ip -4 -o addr show dev enp3s0 2>/dev/null | grep -q '10\.200\.1\.2/24' || ip 
         exec "$HOME/.local/bin/claude-raw" "$@"
     elif [ -x "$HOME/.local/bin/claude" ] && ! grep -q "cld-cage" "$HOME/.local/bin/claude" 2>/dev/null; then
         exec "$HOME/.local/bin/claude" "$@"
-    elif [ -x "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" ]; then
-        exec "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe" "$@"
-    else
-        echo "Error: raw claude binary not found (expected ~/.local/bin/claude-raw or ~/.local/bin/claude)" >&2
-        exit 127
     fi
+    for p in \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude" \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/cli.js" \
+        "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"; do
+        if [ -x "$p" ]; then exec "$p" "$@"; fi
+    done
+    echo "Error: raw claude binary not found (expected ~/.local/bin/claude-raw or ~/.local/bin/claude)" >&2
+    exit 127
 fi
 
 case "$PWD" in
-    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*)
+    *ClaudeCage*|*claude-vpn*|*claudecage*|*cld-cage*|*/.netif-core*|*/.netif-core)
         echo "ОШИБКА БЕЗОПАСНОСТИ: Запуск Claude Code внутри каталога ClaudeCage запрещён!" >&2
         echo "Чтобы агент не обнаружил файлы клетки и факт изоляции, перейдите в ваш рабочий каталог проекта." >&2
         exit 1
         ;;
 esac
 
-exec sudo /usr/local/bin/cld-cage claude "$@"
+if ! sudo -n /usr/local/bin/cld-cage claude "$@"; then
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "Ошибка запуска Claude Code внутри клетки (код $status)." >&2
+        echo "Убедитесь, что настроен /etc/sudoers.d/cld-cage (запустите install.sh)." >&2
+        if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]] && command -v notify-send >/dev/null 2>&1; then
+            notify-send -u critical "ClaudeCage" "Ошибка прав sudoers или сети при запуске Claude Code. Запустите install.sh"
+        fi
+    fi
+    exit $status
+fi

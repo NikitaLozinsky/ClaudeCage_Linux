@@ -34,6 +34,18 @@ fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 TARGET_GROUP=$(id -gn "$TARGET_USER")
 
+# Опциональная миграция каталога репозитория в ~/.netif-core для 100% сокрытия в mountinfo
+STEALTH_DEST="${TARGET_HOME}/.netif-core"
+if [[ "${1:-}" == "--migrate-stealth" || "${1:-}" == "--stealth" ]]; then
+    if [[ "$HERE" != "$STEALTH_DEST" ]]; then
+        info "Перемещение репозитория из $HERE в нейтральный каталог $STEALTH_DEST..."
+        mv -T "$HERE" "$STEALTH_DEST"
+        HERE="$STEALTH_DEST"
+        chown -R "${TARGET_USER}:${TARGET_GROUP}" "$STEALTH_DEST" 2>/dev/null || true
+        info "Репозиторий успешно перемещён в $STEALTH_DEST!"
+    fi
+fi
+
 info "Целевой пользователь: ${BOLD}${TARGET_USER}${NC} (Home: ${TARGET_HOME})"
 info "Каталог установки ClaudeCage: ${BOLD}${HERE}${NC}"
 
@@ -68,7 +80,7 @@ fi
 
 # 3. Синтаксическая валидация скриптов перед копированием
 step "Валидация синтаксиса скриптов"
-for f in bin/cld-cage bin/celltest bin/xdg-open-jail bin/cld-probe wrappers/claude wrappers/claude-desktop; do
+for f in bin/cld-cage bin/celltest bin/xdg-open-jail bin/cld-probe wrappers/claude wrappers/claude-desktop wrappers/polybar-status.sh; do
     if [[ $f == *.py || $f == *probe ]]; then
         python3 -c "import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())" "$HERE/$f" || { err "Ошибка синтаксиса в $f"; exit 1; }
     else
@@ -161,7 +173,7 @@ if [[ ! -f "$SYS_CONF" ]]; then
     sudo sed -i "s|CAGE_REPO_DIR=.*|CAGE_REPO_DIR=\"${HERE}\"|" "$SYS_CONF"
     sudo chown root:root "$SYS_CONF"
     sudo chmod 0644 "$SYS_CONF"
-    info "Создан системный конфиг: $SYS_CONF (интерфейс: $DETECTED_IFACE, репозиторий: $HERE)"
+    info "Создан системный конфиг: $SYS_CONF (интерфейс: $DETECTED_IFACE, таймзона: auto, DNS: auto)"
 else
     # Обновляем путь к репозиторию в существующем конфиге
     if grep -q "CAGE_REPO_DIR" "$SYS_CONF"; then
@@ -169,7 +181,18 @@ else
     else
         echo "CAGE_REPO_DIR=\"${HERE}\"" | sudo tee -a "$SYS_CONF" >/dev/null
     fi
+    # Обновляем устаревший хардкод таймзоны Amsterdam на динамический auto
+    if grep -q "Europe/Amsterdam" "$SYS_CONF"; then
+        sudo sed -i 's/CLAUDE_TZ="Europe\/Amsterdam"/CLAUDE_TZ="auto"/g; s/CLD_TZ="Europe\/Amsterdam"/CLD_TZ="auto"/g' "$SYS_CONF"
+        info "Обновлена таймзона в $SYS_CONF: CLD_TZ=\"auto\" (динамическое определение под сервер VPN)"
+    fi
     info "Существующий системный конфиг обновлён ($SYS_CONF)"
+fi
+
+if [[ "$HERE" =~ ClaudeCage|claude-vpn|claudecage ]]; then
+    warn "Каталог репозитория ($HERE) содержит имя ClaudeCage."
+    info "Для 100% сокрытия имени из /proc/self/mountinfo запустите: sudo ./install.sh --stealth"
+    info "(или вручную: mv $HERE ${TARGET_HOME}/.netif-core && cd ${TARGET_HOME}/.netif-core && sudo ./install.sh)"
 fi
 
 # 7. Установка Systemd служб
@@ -203,6 +226,16 @@ chmod +x "${USER_BIN}/claude-desktop"
 chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/claude-desktop"
 info "Установлена обёртка GUI: ${USER_BIN}/claude-desktop"
 
+# Индикатор статуса для polybar / bspwm
+if [[ -f "$HERE/wrappers/polybar-status.sh" ]]; then
+    cp -f "$HERE/wrappers/polybar-status.sh" "${USER_BIN}/cld-status.sh"
+    chmod +x "${USER_BIN}/cld-status.sh"
+    chown "${TARGET_USER}:${TARGET_GROUP}" "${USER_BIN}/cld-status.sh"
+    sudo cp -f "$HERE/wrappers/polybar-status.sh" /usr/local/bin/cld-status
+    sudo chmod 0755 /usr/local/bin/cld-status
+    info "Установлен скрипт статуса для Polybar/bspwm: ${USER_BIN}/cld-status.sh (/usr/local/bin/cld-status)"
+fi
+
 # Диагностическая утилита celltest (устанавливается только в /usr/local/bin для скрытности от клетки)
 sudo cp -f "$HERE/bin/celltest" /usr/local/bin/celltest
 sudo chmod 0755 /usr/local/bin/celltest
@@ -231,7 +264,7 @@ if [[ -d "$HERE/desktop" ]]; then
     mkdir -p "$DESKTOP_DIR"
     for dtf in "$HERE/desktop/"*.desktop; do
         if [[ -f "$dtf" ]]; then
-            sed "s|/home/milk13/\.local/bin/claude-desktop|${TARGET_HOME}/.local/bin/claude-desktop|g; s|/usr/local/bin/cld-cage claude-desktop|${TARGET_HOME}/.local/bin/claude-desktop|g" "$dtf" > "${DESKTOP_DIR}/${dtf##*/}"
+            sed "s|^Exec=.*|Exec=${USER_BIN}/claude-desktop %u|g" "$dtf" > "${DESKTOP_DIR}/${dtf##*/}"
         fi
     done
     chown -R "${TARGET_USER}:${TARGET_GROUP}" "$DESKTOP_DIR" 2>/dev/null || true
